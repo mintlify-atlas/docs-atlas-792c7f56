@@ -1,0 +1,125 @@
+---
+title: "aeryk kernel architecture and subsystem layout"
+sidebarTitle: "Overview"
+description: "High-level map of aeryk's kernel: boot sequence, memory manager, interrupt handling, scheduling, VFS, syscalls, and userland — and how they connect."
+---
+
+aeryk is a hobbyist x86_64 kernel written in C that boots via the Limine bootloader and implements a complete operating system stack: from physical memory management and hardware interrupt handling, through process scheduling and a virtual filesystem, up to a syscall interface that supports ELF user processes running in ring 3. The sections below map out each layer and how they connect.
+
+## Kernel layers
+
+The kernel is organized as a series of layers, each building on the one below it. A system starts as bare hardware and ends with user processes running under the kernel's control.
+
+```
+┌────────────────────────────────────────────────┐
+│                    Userland                    │  ring 3: /bin/sh, /bin/exectest
+├────────────────────────────────────────────────┤
+│               Syscall interface                │  int 0x80 / SYSCALL, syscall.c
+├────────────────────────────────────────────────┤
+│         VFS / initramfs / ELF loader           │  fs/vfs.c, fs/initramfs.c, elf.c
+├────────────────────────────────────────────────┤
+│           Scheduler / Process model            │  scheduler.c, process.c
+├────────────────────────────────────────────────┤
+│     Memory manager (PMM → VMM → Slab)          │  pmm.c, vmm.c, slab.c
+├────────────────────────────────────────────────┤
+│   Hardware init (GDT / IDT / APIC / Timer)     │  gdt.c, idt.c, apic.c, timer.c
+├────────────────────────────────────────────────┤
+│         Bootloader (Limine protocol)           │  boot/limine.conf, main.c requests
+└────────────────────────────────────────────────┘
+```
+
+## Source directory layout
+
+All architecture-specific code lives under `kernel/src/arch/x86_64/`. The table below describes each major file's role.
+
+| File | Purpose |
+|------|---------|
+| `gdt.c` | Sets up the Global Descriptor Table and Task State Segment. Provides `init_gdt()`, `set_gdt_gate()`, `write_tss()`, and `set_kernel_stack()` for updating rsp0 before ring-3 entry. |
+| `idt.c` | Populates the 256-entry Interrupt Descriptor Table, routes CPU exceptions (vectors 0–31) and IRQs (vectors 32–47), and dispatches to per-IRQ handlers via `isr_handler()`. |
+| `apic.c` | Maps the Local APIC (0xFEE00000) and I/O APIC (0xFEC00000) into the kernel address space, masks the legacy 8259 PIC, enables the LAPIC, and configures IRQ routing. |
+| `timer.c` | Calibrates the APIC timer using the PIT and programs it to fire a periodic tick that drives `mlfq_on_tick()` in the scheduler. |
+| `pmm.c` | Bitmap-based physical memory manager with per-page reference counts. Allocates and frees 4 KiB pages; the refcount mechanism supports copy-on-write fork. |
+| `vmm.c` | 4-level paging (PML4 → PDPT → PD → PT). Creates and destroys per-process page tables, performs COW cloning for `fork()`, and handles `#PF` COW faults. |
+| `slab.c` | Simple slab allocator built on the PMM. Exposes `kmalloc(size)` and `kfree(ptr)` for variable-size kernel heap allocations. |
+| `scheduler.c` | Multi-level feedback queue (MLFQ) scheduler. `schedule()` picks the next runnable process; `mlfq_on_tick()` handles quantum expiry and priority aging. |
+| `process.c` | Process lifecycle: `create_user_process()`, `fork()`, `exit()`, and zombie reaping via `wait_reap_child()`. Allocates kernel stacks and per-process page tables. |
+| `syscall.c` | Installs the syscall handler and dispatches to individual implementations (read, write, fork, exec, wait, exit, …). |
+| `elf.c` | Minimal ELF64 loader: parses PT_LOAD segments and maps them into a user page table. Used by `create_user_process()`. |
+| `fs/vfs.c` | Virtual filesystem layer. Provides a uniform `open`/`read`/`write`/`close` interface that currently delegates to initramfs. |
+| `fs/initramfs.c` | Parses a CPIO archive supplied as a Limine module and registers its files with the VFS. |
+| `drivers/keyboard.c` | PS/2 keyboard driver. Registers an IRQ 1 handler via `irq_install_handler()`, reads scancodes, and feeds them to a ring buffer read by the shell. |
+| `drivers/serial.c` | COM1 serial port driver used for early debug output (`serial_print()`) before the framebuffer is functional. |
+| `tty.c` | Framebuffer text renderer. Wraps the PSF1 font rasterizer and provides `print()` for kernel-side console output. |
+| `font.c` | PSF1 font loader. `load_psf1()` finds the `cp850-8x16.psf` module from Limine and returns a parsed font struct for the renderer. |
+
+## Kernel init order
+
+`kmain()` in `kernel/src/main.c` is the kernel entry point. It calls subsystem initializers in a strict order — each step depends on the ones before it:
+
+<Steps>
+  <Step title="init_gdt()">
+    Installs the null, kernel code, kernel data, user data, user code, and TSS GDT entries, then flushes the GDT and TSS registers.
+  </Step>
+  <Step title="init_idt()">
+    Fills all 256 IDT entries with assembly stub handlers (isr0–isr47) and loads the IDTR.
+  </Step>
+  <Step title="init_display()">
+    Obtains the Limine framebuffer, loads the PSF1 font from the `cp850-8x16.psf` module, and initialises the text renderer. Halts if either is missing.
+  </Step>
+  <Step title="init_serial()">
+    Initialises the COM1 UART for early debug output.
+  </Step>
+  <Step title="init_pmm()">
+    Reads the Limine memory map and HHDM offset. Places the allocation bitmap and per-page refcount array in the first sufficiently large usable region. Marks all usable pages free; reserves physical page 0.
+  </Step>
+  <Step title="init_vmm()">
+    Captures the kernel PML4 from CR3. All subsequent user page tables are built from this root.
+  </Step>
+  <Step title="init_apic_timer()">
+    Maps the LAPIC and IOAPIC, disables the legacy PIC, enables the LAPIC, routes IRQ 1 (keyboard) to IDT vector 33, then calls `init_timer()` to calibrate the APIC timer via the PIT.
+  </Step>
+  <Step title="init_slab()">
+    Sets up the slab allocator caches on top of the PMM. After this point `kmalloc()` and `kfree()` are available.
+  </Step>
+  <Step title="init_scheduler()">
+    Initialises the MLFQ queues and creates the idle process.
+  </Step>
+  <Step title="Smoke tests">
+    `run_slab_smoke_test()` and `run_wait_smoke_test()` validate the allocator and zombie-reaping logic before any user process exists.
+  </Step>
+  <Step title="mount_initramfs()">
+    Locates the `initramfs.cpio` Limine module and parses it into the VFS.
+  </Step>
+  <Step title="init_keyboard()">
+    Registers the PS/2 keyboard IRQ handler on IRQ 1.
+  </Step>
+  <Step title="init_syscalls()">
+    Installs the syscall dispatch table.
+  </Step>
+  <Step title="spawn_initial_processes()">
+    Loads `/bin/exectest` and `/bin/sh` as the first two ring-3 ELF processes using `create_user_process()`.
+  </Step>
+  <Step title="schedule()">
+    Transfers control to the scheduler. Does not return under normal operation; the kernel's role as `kmain` ends here.
+  </Step>
+</Steps>
+
+## Sub-pages
+
+<CardGroup cols={2}>
+  <Card title="Boot" icon="rocket" href="/architecture/boot">
+    Limine bootloader protocol, kernel ELF loading, limine.conf, linker script, and the full kmain() init sequence.
+  </Card>
+  <Card title="Memory" icon="memory" href="/architecture/memory">
+    Bitmap PMM with COW refcounting, 4-level paging VMM, copy-on-write fork, and the slab allocator.
+  </Card>
+  <Card title="Interrupts" icon="bolt" href="/architecture/interrupts">
+    GDT segments and TSS, 256-entry IDT, LAPIC/IOAPIC configuration, and IRQ routing.
+  </Card>
+  <Card title="Scheduler" icon="arrows-rotate" href="/subsystems/scheduler">
+    Multi-level feedback queue design, context switching, and timer-driven preemption.
+  </Card>
+  <Card title="Process Model" icon="sitemap" href="/subsystems/process">
+    Process creation, fork/COW, ELF loading, exit, and zombie reaping.
+  </Card>
+</CardGroup>

@@ -1,0 +1,406 @@
+---
+title: "Userland programs in aeryk: sh, cat, ls, init, and test programs"
+sidebarTitle: "Programs"
+description: "Reference for all aeryk userland programs: the interactive shell (sh), file viewer (cat), directory lister (ls), init, and fork/exec/crash test programs."
+---
+
+aeryk ships seven userland programs, all compiled from sources in the `userland/` directory and available at runtime under `/bin/`. Together they cover the essentials of an interactive session (a shell, a file viewer, a directory lister) plus a set of targeted test programs that exercise the kernel's process primitives: fork, execve, wait, and fault isolation. This page documents each program's behavior drawn directly from its source file.
+
+<Tip>
+To add a new program, drop a `.c` file into `userland/` and add its base name to the `USERLAND_PROGS` list in `GNUmakefile`. No other Makefile changes are needed — the pattern rules pick it up automatically and it will appear in `/bin/` after the next build.
+
+```makefile
+override USERLAND_PROGS := init cat sh ls forktest exectest crashtest mynewprog
+```
+</Tip>
+
+---
+
+## `sh` — Interactive shell
+
+**Source:** `userland/sh.c`
+
+`sh` is the primary interactive program in aeryk. It provides a minimal REPL that reads one command line at a time, tokenizes it, and dispatches it by forking a child and calling `execve`. It is intentionally small — no pipes, no redirection, no job control — but it demonstrates the full fork-exec-wait cycle.
+
+### Usage
+
+```
+> <command> [arg1] [arg2] ...
+> exit
+```
+
+### Behavior
+
+When `sh` starts, it enters an infinite loop:
+
+1. **Prompt:** Prints `> ` to stdout with `printf`.
+2. **Read:** Calls `read(0, line, LINE_MAX)` to block on stdin. The keyboard driver delivers a complete line (including `\n`) per `read` call; `sh` strips the trailing newline.
+3. **Tokenize:** Scans the line in-place, replacing spaces with NUL bytes and recording the start of each token in `argv[]`. Leading and consecutive spaces are skipped.
+4. **Built-in check:** If `argv[0]` is `"exit"`, calls `exit(0)` immediately — the shell process terminates.
+5. **Fork and exec:** For any other command, `sh` prepends `/bin/` to the command name, forks a child, and calls `execve(path, argv)` in the child. If `execve` returns (meaning the binary was not found), the child prints `sh: <cmd>: not found` and calls `exit(1)`.
+6. **Wait:** The parent calls `wait(pid, &status)` and blocks until the child exits before printing the next prompt.
+
+**Constants (from source):**
+
+```c
+#define LINE_MAX  128   /* maximum characters per command line */
+#define MAX_ARGS    8   /* maximum number of space-separated tokens */
+#define BIN_PREFIX "/bin/"
+```
+
+**Full command dispatch (from `userland/sh.c`):**
+
+```c
+int pid = fork();
+if (pid < 0) {
+    printf("sh: fork failed\n");
+    continue;
+}
+
+if (pid == 0) {
+    execve(path, argv);
+    // Only reached if execve() failed.
+    printf("sh: %s: not found\n", argv[0]);
+    exit(1);
+}
+
+int status = 0;
+wait(pid, &status);
+```
+
+### Limitations
+
+- No pipes (`|`), output redirection (`>`), or input redirection (`<`).
+- No command history or line editing — the raw `read()` call delivers whatever the keyboard driver buffers.
+- No `PATH` variable; all external commands are unconditionally resolved as `/bin/<name>`.
+- Maximum 8 arguments (`MAX_ARGS`) and 128-character command lines (`LINE_MAX`).
+
+---
+
+## `cat` — File viewer
+
+**Source:** `userland/cat.c`
+
+`cat` opens a file and streams its contents to stdout in 128-byte chunks. It is the simplest way to inspect files present in the initramfs (e.g., `/hello.txt`).
+
+### Usage
+
+```
+> cat <filename>
+```
+
+### Behavior
+
+```c
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        printf("usage: cat <file>\n");
+        return 1;
+    }
+
+    int fd = open(argv[1]);
+    if (fd < 0) {
+        printf("cat: %s: No such file\n", argv[1]);
+        return 1;
+    }
+
+    char buf[128];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        write(1, buf, n);
+    }
+
+    close(fd);
+    return 0;
+}
+```
+
+1. Checks that exactly one argument was provided; prints usage and exits with code 1 otherwise.
+2. Opens the file with `open(argv[1])`. Prints an error message and exits if `fd < 0`.
+3. Reads the file in 128-byte chunks in a loop. For each chunk, writes the exact byte count to stdout with `write(1, buf, n)`.
+4. Exits the loop when `read` returns `0` (EOF) or negative (error), then closes the fd.
+
+### Limitations
+
+- Only one file argument is supported; `cat file1 file2` will only show `file1`.
+- No `-n` (line numbering) or other flags.
+
+---
+
+## `ls` — Directory lister
+
+**Source:** `userland/ls.c`
+
+`ls` lists the entries of a directory by calling the `listdir()` libc wrapper (which issues `SYS_readdir = 78`). The kernel writes each entry name into the provided buffer, one per line, with a trailing `/` for subdirectories.
+
+### Usage
+
+```
+> ls [path]
+```
+
+If no `path` argument is given, `ls` defaults to `"/"`.
+
+### Behavior
+
+```c
+int main(int argc, char **argv) {
+    const char *path = (argc > 1) ? argv[1] : "/";
+
+    char buf[512];
+    ssize_t n = listdir(path, buf, sizeof(buf));
+    if (n < 0) {
+        printf("ls: %s: No such directory\n", path);
+        return 1;
+    }
+
+    write(1, buf, n);
+    return 0;
+}
+```
+
+1. Picks `argv[1]` as the target path, falling back to `"/"` if no argument is given.
+2. Calls `listdir(path, buf, 512)`. The kernel fills `buf` with `\n`-separated entry names and returns the number of bytes written.
+3. If `listdir` returns `-1`, the path is not a directory (or doesn't exist); prints an error message.
+4. On success, writes the full buffer to stdout in a single `write` call.
+
+### Limitations
+
+- Output buffer is capped at 512 bytes. Directories with many entries may be silently truncated.
+- No sorting, column layout, or long-format (`-l`) output.
+
+---
+
+## `init` — First userland process
+
+**Source:** `userland/init.c`
+
+`init` is conceptually the first userland process — PID 1 in a traditional Unix system. In aeryk it is a simple diagnostic program that prints a banner, attempts to open and display `/hello.txt` from the initramfs, and then returns.
+
+### Behavior
+
+```c
+int main(void) {
+    printf("Hello from /bin/init (ring 3)!\n");
+
+    char buffer[128];
+    int fd = open("/hello.txt");
+    if (fd >= 0) {
+        ssize_t n = read(fd, buffer, sizeof(buffer));
+        if (n > 0) {
+            printf("Contents of /hello.txt:\n");
+            write(1, buffer, n);
+        }
+        close(fd);
+    }
+
+    return 0;
+}
+```
+
+The banner `"Hello from /bin/init (ring 3)!"` confirms that the kernel successfully loaded and executed a ring-3 binary. The `/hello.txt` read-and-print verifies that the VFS and `SYS_read` work end-to-end. The file is created by the Makefile during the initramfs build:
+
+```makefile
+echo "Hello from the aeryk cpio initramfs!" > initramfs_root/hello.txt
+```
+
+<Note>
+In the current aeryk implementation, the kernel spawns `/bin/sh` directly rather than delegating process spawning to `/bin/init`. The `init` binary is still present in `/bin/` and can be run manually from the shell with `> init`.
+</Note>
+
+---
+
+## `forktest` — Fork and copy-on-write test
+
+**Source:** `userland/forktest.c`
+
+`forktest` validates that `fork()` correctly isolates the parent and child's address spaces. It uses a static variable to confirm that a write in the child is not visible in the parent — which would break if copy-on-write (COW) page duplication were not working.
+
+### Usage
+
+```
+> forktest
+```
+
+### Behavior
+
+```c
+static int counter = 1;
+
+void main(void) {
+    printf("forktest: before fork, counter=%d\n", counter);
+
+    int pid = fork();
+
+    if (pid == 0) {
+        // Child: write to the shared-before-fork page.
+        // Under COW this must fault, get a private copy,
+        // and not affect the parent's value.
+        counter = 99;
+        printf("forktest: child running, counter=%d\n", counter);
+        exit(42);
+    } else if (pid > 0) {
+        int status = 0;
+        int reaped = wait(pid, &status);
+        printf("forktest: parent after wait, counter=%d (expect 1) reaped=%d status=%d\n",
+               counter, reaped, status);
+    } else {
+        printf("forktest: fork() failed\n");
+    }
+
+    exit(0);
+}
+```
+
+**Expected output:**
+
+```
+forktest: before fork, counter=1
+forktest: child running, counter=99
+forktest: parent after wait, counter=1 (expect 1) reaped=<pid> status=42
+```
+
+The parent's `counter` remaining `1` after the child sets it to `99` confirms that the COW mechanism correctly gave the child its own private page. The `status=42` confirms that `wait()` correctly propagates the child's exit code.
+
+---
+
+## `exectest` — Execve test
+
+**Source:** `userland/exectest.c`
+
+`exectest` validates that `execve()` correctly replaces a process's ELF image with a new binary while preserving the PID, open file descriptors, and parent relationship. It forks a child and then execs `/bin/ls /bin` in that child, so the parent can reap it normally.
+
+### Usage
+
+```
+> exectest
+```
+
+### Behavior
+
+```c
+void main(void) {
+    printf("exectest: before fork\n");
+
+    int pid = fork();
+
+    if (pid == 0) {
+        printf("exectest: child execing /bin/ls\n");
+        char *argv[] = {"/bin/ls", "/bin", NULL};
+        execve("/bin/ls", argv);
+        // Only reached if execve() failed.
+        printf("exectest: execve() failed\n");
+        exit(1);
+    } else if (pid > 0) {
+        int status = 0;
+        int reaped = wait(pid, &status);
+        printf("exectest: parent reaped pid=%d status=%d\n", reaped, status);
+    } else {
+        printf("exectest: fork() failed\n");
+    }
+
+    exit(0);
+}
+```
+
+**Expected output:**
+
+```
+exectest: before fork
+exectest: child execing /bin/ls
+bin/
+exectest: parent reaped pid=<pid> status=0
+```
+
+The directory listing produced by the exec'd `ls` appearing in the middle of `exectest`'s output confirms that the child's image was completely replaced by `/bin/ls` and that its stdout (fd 1) was inherited correctly.
+
+---
+
+## `crashtest` — Fault isolation test
+
+**Source:** `userland/crashtest.c`
+
+`crashtest` is an intentional fault injector. It forks a child, induces a hardware exception in that child, and then verifies that the parent (and the rest of the system) continues running normally. This confirms that aeryk's interrupt handler (`isr_handler` in `idt.c`) correctly kills only the faulting process and does not halt the kernel.
+
+### Usage
+
+```
+> crashtest [null|div0|ud2]
+```
+
+| Argument | Fault type |
+|---|---|
+| `null` (default) | Null pointer write → page fault (`#PF`) |
+| `div0` | Integer divide by zero → `#DE` |
+| `ud2` | Undefined instruction → `#UD` |
+
+### Behavior
+
+```c
+static void crash(const char *kind) {
+    if (strcmp(kind, "div0") == 0) {
+        volatile int zero = 0;
+        volatile int result = 1 / zero;
+        (void)result;
+    } else if (strcmp(kind, "ud2") == 0) {
+        asm volatile("ud2");
+    } else {
+        // Default: null pointer write -> page fault.
+        volatile int *p = (volatile int *)0;
+        *p = 1;
+    }
+}
+
+void main(int argc, char *argv[]) {
+    const char *kind = argc > 1 ? argv[1] : "null";
+
+    printf("crashtest: before fork, crash kind=%s\n", kind);
+
+    int pid = fork();
+
+    if (pid == 0) {
+        printf("crashtest: child about to crash\n");
+        crash(kind);
+        // Should never reach here.
+        printf("crashtest: child survived the crash?!\n");
+        exit(1);
+    } else if (pid > 0) {
+        int status = 0;
+        int reaped = wait(pid, &status);
+        printf("crashtest: parent alive after wait, reaped=%d status=%d\n",
+               reaped, status);
+    } else {
+        printf("crashtest: fork() failed\n");
+    }
+
+    exit(0);
+}
+```
+
+**Expected output (null dereference):**
+
+```
+crashtest: before fork, crash kind=null
+crashtest: child about to crash
+crashtest: parent alive after wait, reaped=<pid> status=<fault_code>
+```
+
+The parent printing `"parent alive after wait"` after the child faults is the key assertion: the kernel handled the CPL3 exception, terminated the child, and returned control to the parent's `wait()` call — without a kernel panic or system freeze.
+
+<Note>
+The `volatile` keyword on the crash variables is essential. Without it, the compiler may optimize away the divide-by-zero or null-dereference because the result is never used, and the fault would never fire.
+</Note>
+
+---
+
+## Program summary
+
+| Binary | Source | Key syscalls used | Purpose |
+|---|---|---|---|
+| `/bin/init` | `userland/init.c` | `open`, `read`, `write` | Banner + initramfs file read |
+| `/bin/sh` | `userland/sh.c` | `read`, `write`, `fork`, `execve`, `wait`, `exit` | Interactive shell |
+| `/bin/cat` | `userland/cat.c` | `open`, `read`, `write`, `close` | Stream file to stdout |
+| `/bin/ls` | `userland/ls.c` | `listdir`, `write` | List directory entries |
+| `/bin/forktest` | `userland/forktest.c` | `fork`, `wait`, `exit` | COW page isolation test |
+| `/bin/exectest` | `userland/exectest.c` | `fork`, `execve`, `wait`, `exit` | Image replacement test |
+| `/bin/crashtest` | `userland/crashtest.c` | `fork`, `wait`, `exit` + intentional fault | CPL3 fault isolation test |

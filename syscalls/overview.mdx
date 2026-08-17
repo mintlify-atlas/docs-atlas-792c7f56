@@ -1,0 +1,172 @@
+---
+title: "Syscall mechanism: SYSCALL/SYSRET MSR setup in aeryk"
+sidebarTitle: "Overview"
+description: "How aeryk implements system calls using the x86_64 SYSCALL/SYSRET MSR path, syscall_entry assembly trampoline, and the C syscall_handler_c dispatcher."
+---
+
+aeryk implements system calls using the native x86_64 `SYSCALL`/`SYSRET` instruction pair rather than the legacy `int 0x80` software-interrupt path. The `SYSCALL` instruction is faster because it does not push a full interrupt frame onto the stack and avoids the IDT lookup entirely — the CPU simply jumps to a fixed address loaded in an MSR. `init_syscalls()` in `kernel/src/arch/x86_64/syscall.c` programs those MSRs at boot, after which every user-mode `syscall` instruction lands in the `syscall_entry` assembly trampoline, which builds a `syscall_frame` on the kernel stack and calls the C dispatcher `syscall_handler_c`.
+
+## Why SYSCALL/SYSRET instead of int 0x80
+
+The `int 0x80` path was the original i386 calling convention. It pushes a hardware interrupt frame (error code, RIP, CS, RFLAGS, RSP, SS) and must traverse the IDT, adding latency and stack overhead. The `SYSCALL` instruction was introduced alongside AMD64 precisely to eliminate that overhead: on entry the CPU saves `RIP` into `RCX` and `RFLAGS` into `R11`, then jumps straight to the address in `MSR_LSTAR`. No privilege-level gate, no IDT, no hardware-pushed frame. `SYSRET` reverses the process, restoring `RIP` from `RCX` and `RFLAGS` from `R11` before returning to ring 3. aeryk targets x86_64 exclusively, so the `SYSCALL`/`SYSRET` path is the natural — and only — choice.
+
+## MSR registers configured in init_syscalls()
+
+`init_syscalls()` writes four MSRs to configure the mechanism:
+
+```c
+void init_syscalls(void)
+{
+    // Enable syscall extension bit
+    uint64_t efer = rdmsr(MSR_EFER);
+    wrmsr(MSR_EFER, efer | 1);
+
+    // Kernel CS (0x08) in bits 32-47; User CS base (0x10) in bits 48-63
+    wrmsr(MSR_STAR, ((uint64_t)0x08 << 32) | ((uint64_t)0x10 << 48));
+
+    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
+
+    wrmsr(MSR_FMASK, 0x200);
+}
+```
+
+| MSR | Address | Purpose |
+|-----|---------|---------|
+| `MSR_EFER` | `0xC0000080` | Extended Feature Enable Register — bit 0 is the **SCE** (System Call Extensions) flag. aeryk ORs the current value with `1` to enable `SYSCALL`/`SYSRET` support. |
+| `MSR_STAR` | `0xC0000081` | Segment selectors. Bits 32–47 hold the **kernel CS** (`0x08`); bits 48–63 hold the **user CS base** (`0x10`). On `SYSRET`, the CPU derives user CS as `base + 16` (`0x20`) and user SS as `base + 8` (`0x18`). |
+| `MSR_LSTAR` | `0xC0000082` | **Long-mode STAR** — the 64-bit address the CPU jumps to when `SYSCALL` is executed. aeryk writes the address of the `syscall_entry` assembly label here. |
+| `MSR_FMASK` | `0xC0000084` | RFLAGS bits to **clear on syscall entry**. aeryk writes `0x200`, which is the `IF` (Interrupt Flag) bit, disabling hardware interrupts for the duration of the kernel syscall path. |
+
+## syscall_entry assembly trampoline
+
+`syscall_entry` (in `kernel/src/arch/x86_64/syscall_entry.asm`) is the first code to run after the CPU accepts a `SYSCALL`. At that point the processor is still using the user-mode stack pointer, so the trampoline's first job is to switch to a safe kernel stack before touching any stack-allocated data.
+
+```asm
+syscall_entry:
+  ; SYSCALL saves user RIP → RCX, user RFLAGS → R11 automatically.
+  ; Switch to the kernel stack safely.
+  mov [rel user_rsp_scratch], rsp
+  mov rsp, [rel kernel_rsp_scratch]
+
+  ; Push callee-saved registers first so fork() can snapshot the full context.
+  push rbx
+  push rbp
+  push r12
+  push r13
+  push r14
+  push r15
+
+  push rcx                          ; user RIP  (saved by SYSCALL into RCX)
+  push r11                          ; user RFLAGS (saved by SYSCALL into R11)
+  push qword [rel user_rsp_scratch] ; user RSP
+
+  ; Syscall arguments follow (System V AMD64 ABI, R10 replaces RCX).
+  push rdi
+  push rsi
+  push rdx
+  push r10
+  push r8
+  push r9
+  push rax  ; syscall number
+
+  ; Pass the frame pointer to the C dispatcher.
+  mov rdi, rsp
+  call syscall_handler_c
+
+  ; Restore argument registers.
+  pop rax
+  pop r9
+  pop r8
+  pop r10
+  pop rdx
+  pop rsi
+  pop rdi
+
+  ; Restore user RIP, RFLAGS, and RSP.
+  mov rcx, [rsp + 16]  ; user RIP
+  mov r11, [rsp + 8]   ; user RFLAGS
+  mov rsp, [rsp]       ; user RSP
+
+  o64 sysret
+```
+
+The key steps are:
+
+1. **Stack switch** — the user RSP is stashed in the `user_rsp_scratch` variable and the kernel RSP is loaded from `kernel_rsp_scratch` (written by the process scheduler before returning to user mode).
+2. **Frame construction** — registers are pushed onto the kernel stack in a specific order that mirrors the `syscall_frame` struct layout (see below). The callee-saved registers are pushed *before* the return-state fields so that `fork()` can snapshot the full caller context without any additional work.
+3. **Dispatch** — `RSP` (pointing at the bottom of the pushed frame) is moved into `RDI` and `syscall_handler_c` is called. The C ABI passes the first argument in `RDI`, so the C function receives a typed `struct syscall_frame *` pointer.
+4. **Restore and return** — argument registers are popped, then `RCX`/`R11`/`RSP` are restored from the frame slots that `SYSCALL` originally saved, and `o64 sysret` returns to ring 3.
+
+## syscall_frame struct
+
+`syscall_handler_c` receives a pointer to the stack layout built by `syscall_entry`. The C definition mirrors that layout exactly:
+
+```c
+struct syscall_frame
+{
+    uint64_t rax;           /* syscall number / return value */
+    uint64_t r9, r8, r10, rdx, rsi, rdi; /* syscall arguments */
+    uint64_t user_rsp;      /* user stack pointer at time of SYSCALL */
+    uint64_t user_rflags;   /* user RFLAGS (from R11 after SYSCALL) */
+    uint64_t user_rip;      /* user RIP (from RCX after SYSCALL) */
+    /* Callee-saved registers — pushed by syscall_entry purely so fork()
+     * can snapshot the caller's full context. The C ABI keeps them intact
+     * across the call to syscall_handler_c, so they are never restored
+     * from here on the return path. */
+    uint64_t r15, r14, r13, r12, rbp, rbx;
+};
+```
+
+`syscall_handler_c` reads `frame->rax` to determine which system call was requested and writes the return value back into `frame->rax` before returning, so `syscall_entry` naturally pops the modified value into `RAX` on the way out.
+
+<Note>
+  The callee-saved fields (`r15`–`rbx`) at the tail of `syscall_frame` are
+  there for `fork()`'s benefit. `SYS_fork` constructs a `trapframe_t` from
+  those fields and passes it to `fork_process()`, giving the child process an
+  accurate snapshot of the parent's register state so it can resume execution
+  at the same point after the `fork()` call returns.
+</Note>
+
+## Calling convention
+
+aeryk follows the standard Linux x86_64 syscall ABI:
+
+| Register | Role |
+|----------|------|
+| `RAX` | Syscall number (in) / return value (out) |
+| `RDI` | First argument |
+| `RSI` | Second argument |
+| `RDX` | Third argument |
+| `R10` | Fourth argument (replaces `RCX`, which `SYSCALL` clobbers) |
+| `R8` | Fifth argument |
+| `R9` | Sixth argument |
+| `RCX` | Clobbered by `SYSCALL` (receives `RIP`) |
+| `R11` | Clobbered by `SYSCALL` (receives `RFLAGS`) |
+
+All libc wrappers in `libc/unistd.c` and `libc/stdlib/exit.c` follow this pattern. Here is the `write` wrapper as a representative example:
+
+```c
+ssize_t write(int fd, const void *buf, size_t count) {
+    long ret;
+    asm volatile("syscall"
+                 : "=a"(ret)
+                 : "0"(SYS_write), "D"(fd), "S"(buf), "d"(count)
+                 : "rcx", "r11", "memory");
+    return ret;
+}
+```
+
+The constraints map directly to registers: `"0"` reuses the `"=a"` operand slot (loads `RAX` with the syscall number), `"D"` → `RDI`, `"S"` → `RSI`, `"d"` → `RDX`. `RCX` and `R11` are listed as clobbers because `SYSCALL` overwrites them unconditionally.
+
+## Shared ABI header
+
+The syscall numbers (`SYS_read`, `SYS_write`, …) live in a single header that both the kernel and libc include:
+
+```
+abi/include/abi/syscall.h   ← single source of truth
+    ↑                             ↑
+kernel/src/arch/x86_64/     libc/include/sys/
+  include/syscall.h               syscall.h
+```
+
+`libc/include/sys/syscall.h` contains only `#include <abi/syscall.h>`, and `kernel/src/arch/x86_64/include/syscall.h` does the same. This ensures the kernel handler and all userland wrappers can never disagree on a syscall number.

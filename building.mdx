@@ -1,0 +1,135 @@
+---
+title: "Build aeryk from source on macOS and Linux"
+sidebarTitle: "Building"
+description: "Install cross-compilation toolchain, clone dependencies, and compile a bootable aeryk ISO with a single make command on macOS or Linux."
+---
+
+aeryk is built with a standard GNU toolchain and a handful of host utilities. On macOS you need a cross-compiler (`x86_64-elf-gcc`) because Apple's Clang cannot emit freestanding ELF objects; on Linux the native `gcc` targets ELF directly. Either way the build ends with a single `make` command that produces a bootable `template-x86_64.iso`.
+
+## Prerequisites
+
+<Tabs>
+  <Tab title="macOS">
+    Install the cross-compilation toolchain and build tools via Homebrew:
+
+    ```sh
+    brew install make x86_64-elf-gcc qemu xorriso
+    ```
+
+    <Note>
+      The Homebrew formula installs the compiler as `x86_64-elf-gcc`. You must pass `TOOLCHAIN_PREFIX=x86_64-elf-` to every `make` invocation so the build system picks up the correct binaries for both the kernel and userland ELFs.
+    </Note>
+  </Tab>
+  <Tab title="Linux (Debian / Ubuntu)">
+    Install the build essentials, QEMU, and the ISO tool from your distro's package manager:
+
+    ```sh
+    sudo apt install build-essential gcc qemu-system-x86 xorriso
+    ```
+
+    The system `gcc` on Linux already targets `x86_64-linux-gnu` ELF, so no cross-compiler is needed and `TOOLCHAIN_PREFIX` can be left unset.
+  </Tab>
+</Tabs>
+
+## The `TOOLCHAIN_PREFIX` variable
+
+The `GNUmakefile` exposes a `TOOLCHAIN_PREFIX` variable that is prepended to `gcc`, `ld`, and `ar` for **both** the kernel and every userland binary:
+
+```makefile
+USER_CC := $(TOOLCHAIN_PREFIX)gcc
+USER_LD := $(TOOLCHAIN_PREFIX)ld
+USER_AR := $(TOOLCHAIN_PREFIX)ar
+```
+
+| Platform | Value to pass              | Effective compiler        |
+| -------- | -------------------------- | ------------------------- |
+| macOS    | `TOOLCHAIN_PREFIX=x86_64-elf-` | `x86_64-elf-gcc`      |
+| Linux    | _(unset)_                  | `gcc`                     |
+
+## Build steps
+
+<Steps>
+  <Step title="Clone the repository">
+    ```sh
+    git clone https://github.com/Riley1101/aeryk.git
+    cd aeryk
+    ```
+  </Step>
+
+  <Step title="Fetch kernel protocol headers">
+    Run the helper script that downloads the Limine protocol headers into `kernel/limine-protocol/`:
+
+    ```sh
+    ./kernel/get-deps
+    ```
+
+    This only needs to be run once. It clones a pinned revision of the Limine protocol so the kernel headers stay in sync with the bootloader binary fetched at build time.
+  </Step>
+
+  <Step title="Build the ISO">
+    <Tabs>
+      <Tab title="macOS">
+        ```sh
+        make TOOLCHAIN_PREFIX=x86_64-elf-
+        ```
+      </Tab>
+      <Tab title="Linux">
+        ```sh
+        make
+        ```
+      </Tab>
+    </Tabs>
+
+    The build produces **`template-x86_64.iso`** in the repository root.
+  </Step>
+</Steps>
+
+## What the build does
+
+A successful `make` run performs the following steps in order:
+
+1. **Clones Limine** (`limine/limine`) from the `v11.x-binary` branch if not already present and builds the host-side `limine` tool.
+2. **Compiles the kernel** by recursing into `kernel/` with `$(MAKE) -C kernel`.
+3. **Builds userland ELFs** — compiles `libc.a` (from `libc/`) and `crt0.o` (from `kernel/src/arch/x86_64/crt0.asm`), then links each program in `userland/` against them:
+
+   | Program       | Purpose                                              |
+   | ------------- | ---------------------------------------------------- |
+   | `init`        | PID 1 placeholder                                    |
+   | `cat`         | Print file contents to stdout                        |
+   | `sh`          | Interactive line-buffered shell                      |
+   | `ls`          | List directory entries                               |
+   | `forktest`    | Exercises `fork` + `wait` syscalls                   |
+   | `exectest`    | Exercises `execve` syscall                           |
+   | `crashtest`   | Triggers a CPL 3 fault to verify the kernel kills the offending process instead of panicking |
+
+4. **Packs `initramfs.cpio`** — copies every `.elf` into `initramfs_root/bin/` and runs `cpio -o -H newc` to produce the CPIO archive that Limine loads as a module.
+5. **Assembles the ISO** with `xorriso`, embeds Limine BIOS stage 1 with `limine bios-install`, and copies the UEFI stubs (`BOOTX64.EFI`, `BOOTIA32.EFI`) into `EFI/BOOT/`.
+
+## Makefile targets reference
+
+| Target        | Description                                                    |
+| ------------- | -------------------------------------------------------------- |
+| `all`         | _(default)_ Build `template-x86_64.iso`                        |
+| `all-hdd`     | Build `template-x86_64.hdd` (raw GPT HDD image)               |
+| `clean`       | Remove build artefacts, object files, and the ISO              |
+| `distclean`   | Like `clean`, but also removes `limine/`, `edk2-ovmf/`, `unity/`, and generated docs |
+| `test`        | Build and run the Unity-based unit tests for GDT, IDT, VMM, slab, scheduler, syscall, and PMM |
+| `docs`        | Generate Doxygen HTML documentation into `docs/`               |
+
+## LSP / editor support
+
+If your editor relies on `compile_commands.json` for features like "Go to definition" and "Find references", generate it with [bear](https://github.com/rizsotto/Bear):
+
+```sh
+bear -- make
+```
+
+This wraps the build and intercepts every compiler invocation to produce `compile_commands.json` in the repository root. Pass `TOOLCHAIN_PREFIX=x86_64-elf-` on macOS as usual:
+
+```sh
+bear -- make TOOLCHAIN_PREFIX=x86_64-elf-
+```
+
+<Warning>
+  `bear` must wrap the full `make` invocation that compiles source files. Running `bear -- make` after a complete build that left no files to recompile will produce an empty `compile_commands.json`. Run `make clean` first if needed.
+</Warning>

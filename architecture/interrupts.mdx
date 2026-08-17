@@ -1,0 +1,299 @@
+---
+title: "GDT, IDT, and APIC interrupt handling in aeryk"
+sidebarTitle: "Interrupts"
+description: "How aeryk configures the Global Descriptor Table, Interrupt Descriptor Table, and APIC for exception handling, IRQ routing, and the APIC timer tick."
+---
+
+aeryk's interrupt infrastructure consists of three cooperating pieces: the Global Descriptor Table (GDT), which defines the memory segments and privilege rings the CPU enforces; the Interrupt Descriptor Table (IDT), which maps every exception vector and hardware IRQ to a handler; and the Advanced Programmable Interrupt Controller (APIC), which routes hardware interrupts from devices through the IDT and drives the scheduler timer tick. `init_gdt()` and `init_idt()` are the very first two calls in `kmain()` — everything else depends on a working segment environment and interrupt dispatch table.
+
+---
+
+## GDT — Global Descriptor Table
+
+The GDT is implemented in `kernel/src/arch/x86_64/gdt.c` and declared in `gdt.h`. aeryk's GDT contains seven entries (indices 0–6). The TSS occupies two consecutive slots (5 and 6) because a 64-bit TSS descriptor is 16 bytes — twice the normal 8-byte entry size.
+
+| Index | Descriptor | Access byte | Notes |
+|-------|-----------|-------------|-------|
+| 0 | Null | `0x00` | Required by the x86 spec |
+| 1 | Kernel code | `0x9A` | 64-bit, L=1, DPL=0 |
+| 2 | Kernel data | `0x92` | DPL=0 |
+| 3 | User data | `0xF2` | DPL=3 — placed before user code for SYSRET ordering |
+| 4 | User code | `0xFA` | 64-bit, L=1, DPL=3 |
+| 5–6 | TSS | `0x89` | 16-byte 64-bit system descriptor |
+
+<Note>
+  User data (index 3) is placed **before** user code (index 4) intentionally. AMD's `SYSRET` instruction hard-codes the assumption that the user data segment selector is immediately below the user code selector in the GDT. Getting this order wrong causes a GPF on the first SYSRET.
+</Note>
+
+### Task State Segment
+
+The TSS is the mechanism the CPU uses to find the correct kernel stack when an interrupt or exception fires while running ring-3 code. aeryk's `tss_entry_struct` matches the 64-bit TSS layout described in the Intel SDM:
+
+```c
+// gdt.h
+
+struct tss_entry_struct {
+    uint32_t reserved0;
+    uint64_t rsp0;     // kernel stack pointer loaded on ring 3 → ring 0 transition
+    uint64_t rsp1;
+    uint64_t rsp2;
+    uint64_t reserved1;
+    uint64_t ist[7];   // Interrupt Stack Table — alternative stacks for NMI, DF, etc.
+    uint64_t reserved2;
+    uint16_t reserved3;
+    uint16_t iomap_base;
+} __attribute__((packed));
+```
+
+`rsp0` is the field the CPU reads to set RSP when an interrupt arrives while CPL=3. Before switching into a ring-3 process, the kernel calls `set_kernel_stack()` to update `tss_entry.rsp0` with the process's kernel stack top:
+
+```c
+// gdt.h
+
+// Updates tss_entry.rsp0 to the given kernel stack pointer.
+// Must be called before entering ring 3 so the CPU uses the correct
+// kernel stack if an interrupt fires inside the user process.
+void set_kernel_stack(uint64_t rsp0);
+```
+
+### GDT API
+
+```c
+// gdt.h
+
+// Installs all GDT entries (null, kernel code/data, user data/code, TSS),
+// calls gdt_flush() and tss_flush().
+void init_gdt(void);
+
+// Writes a single GDT entry at index `num`.
+void set_gdt_gate(uint32_t num, uint32_t base, uint32_t limit,
+                  uint8_t access, uint8_t gran);
+
+// Writes the 16-byte TSS descriptor into GDT slots `num` and `num+1`
+// and initialises tss_entry with rsp0 = rsp0_val.
+void write_tss(uint32_t num, uint64_t rsp0);
+
+// Updates tss_entry.rsp0. Call before every ring-3 entry.
+void set_kernel_stack(uint64_t rsp0);
+
+// Executes `lgdt` with the supplied pointer — switches the CPU to the new GDT.
+void gdt_flush(struct gdt_ptr_struct *ptr);
+
+// Executes `ltr` to load the TSS selector into the TR register.
+void tss_flush(void);
+```
+
+---
+
+## IDT — Interrupt Descriptor Table
+
+The IDT is implemented in `kernel/src/arch/x86_64/idt.c` and declared in `idt.h`. It contains 256 entries; vectors 0–31 are CPU exceptions and vectors 32–47 are hardware IRQs remapped from what would traditionally come from the PIC (aeryk uses the APIC instead, but the vector numbering is kept the same).
+
+### IDT entry structure
+
+```c
+// idt.h
+
+struct idt_entry_struct {
+    uint16_t base_low;        // handler address bits 0–15
+    uint16_t set;             // segment selector (0x08 = kernel code)
+    uint8_t  ist;             // Interrupt Stack Table index (0 = none)
+    uint8_t  type_attributes; // gate type + DPL + present (0x8E for interrupt gate)
+    uint16_t base_middle;     // handler address bits 16–31
+    uint32_t base_high;       // handler address bits 32–63
+    uint32_t reserved;
+} __attribute__((packed));
+```
+
+All 48 gates are installed with selector `0x08` (kernel code segment), IST `0`, and type `0x8E` (present, interrupt gate, DPL=0). Using an interrupt gate means the CPU automatically clears IF (disables interrupts) on entry.
+
+### interrupt_frame
+
+Every ISR stub (written in assembly in `idt.asm`) pushes all general-purpose registers and then calls `isr_handler()` with a pointer to this structure on the stack:
+
+```c
+// idt.h
+
+struct interrupt_frame {
+    // General-purpose registers (pushed by assembly stub, in this order)
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    // Interrupt metadata (pushed by stub or CPU)
+    uint64_t int_no;    // interrupt vector number
+    uint64_t err_code;  // CPU error code (0 for exceptions that don't produce one)
+    // CPU-pushed on interrupt entry
+    uint64_t rip, cs, rflags, rsp, ss;
+};
+```
+
+The `cs` field is particularly important: `(frame->cs & 3) == 3` tests whether the interrupted code was running at CPL 3 (user mode) or CPL 0 (kernel mode). `isr_handler()` uses this to decide whether a fault should kill the process or panic the kernel.
+
+### IDT API
+
+```c
+// idt.h
+
+typedef void (*irq_handler_t)(struct interrupt_frame *frame);
+
+// Populates all 256 IDT entries and executes `lidt`.
+void init_idt(void);
+
+// Writes a single IDT gate.
+void set_idt_gate(uint32_t num, uint64_t handler, uint16_t set,
+                  uint8_t ist, uint8_t type_attributes);
+
+// Central dispatch: handles CPU exceptions (0–31) and IRQs (32–47).
+void isr_handler(struct interrupt_frame *frame);
+
+// Registers a handler function for hardware IRQ `irq` (0–15).
+void irq_install_handler(int irq, irq_handler_t handler);
+
+// Clears the handler for hardware IRQ `irq`.
+void irq_uninstall_handler(int irq);
+```
+
+### Exception handling and CPL-3 faults
+
+`isr_handler()` distinguishes three cases for vectors 0–31:
+
+1. **Write page fault (#PF, vector 14) with a COW mapping**: the handler reads CR2 for the faulting address and calls `vmm_handle_cow_fault()`. If it returns `1` (fault resolved), the handler returns immediately and the CPU retries the instruction.
+
+2. **Any other exception from ring 3** (`(frame->cs & 3) == 3`): the offending process is marked `PROCESS_DEAD` with `exit_code = -1` and the kernel calls `schedule()` to switch to the next runnable process. The system stays up; only the misbehaving process dies.
+
+3. **Any exception from ring 0**: a kernel bug. The handler prints `KERNEL PANIC` to the serial port and executes `cli; hlt` to freeze the machine.
+
+```c
+// From idt.c — CPL-3 fault path
+int from_userland = current_process && (frame->cs & 3) == 3;
+if (from_userland) {
+    current_process->exit_code = -1;
+    current_process->state    = PROCESS_DEAD;
+    asm volatile("sti");   // re-enable interrupts before schedule()
+    schedule();
+    for (;;) asm volatile("hlt");
+}
+```
+
+### IRQ dispatch
+
+Vectors 32–47 are hardware IRQs. `isr_handler()` subtracts 32 to get a 0-based IRQ index, calls `lapic_eoi()` to acknowledge the interrupt, and then invokes the registered `irq_handlers[irq]` function if one is present.
+
+<Note>
+  `lapic_eoi()` is called **before** the user handler runs, not after. This is intentional — it lets the LAPIC accept new interrupts from other sources while the current handler is executing, which is important for the timer tick not to starve other IRQs.
+</Note>
+
+---
+
+## APIC — Advanced Programmable Interrupt Controller
+
+The APIC subsystem is implemented in `kernel/src/arch/x86_64/apic.c` and declared in `apic.h`. aeryk uses the Local APIC (LAPIC) on every CPU core for per-CPU timer and EOI signalling, and the I/O APIC for routing external hardware IRQs to IDT vectors.
+
+### Memory-mapped registers
+
+Both the LAPIC and IOAPIC are accessed through memory-mapped I/O. Their physical base addresses are fixed by the x86 specification:
+
+```c
+// apic.h
+
+#define LAPIC_BASE   0xFEE00000ULL
+#define IOAPIC_BASE  0xFEC00000ULL
+```
+
+Before either can be used, `init_apic()` calls `vmm_map_page()` to create kernel virtual-address mappings for both regions. All subsequent accesses go through `LAPIC_BASE + hhdm_offset` (or `IOAPIC_BASE + hhdm_offset`).
+
+### LAPIC registers
+
+```c
+// apic.h
+
+#define LAPIC_ID           0x020  // LAPIC ID register
+#define LAPIC_TPR          0x080  // Task Priority Register (0 = accept all)
+#define LAPIC_EOI          0x0B0  // End-of-Interrupt register
+#define LAPIC_SVR          0x0F0  // Spurious Vector Register (bit 8 = enable)
+#define LAPIC_TIMER_LVT    0x320  // Timer Local Vector Table entry
+#define LAPIC_TIMER_INITCNT 0x380 // Timer Initial Count
+#define LAPIC_TIMER_CURCNT 0x390  // Timer Current Count (read-only)
+#define LAPIC_TIMER_DIV    0x3E0  // Timer Divide Configuration
+```
+
+### init_apic()
+
+`init_apic()` performs the full APIC bringup sequence:
+
+```c
+void init_apic(void) {
+    // Map LAPIC and IOAPIC into the kernel's virtual address space
+    vmm_map_page(vmm_get_kernel_pml4(),
+                 LAPIC_BASE + hhdm_offset, LAPIC_BASE,
+                 PTE_PRESENT | PTE_WRITABLE);
+    vmm_map_page(vmm_get_kernel_pml4(),
+                 IOAPIC_BASE + hhdm_offset, IOAPIC_BASE,
+                 PTE_PRESENT | PTE_WRITABLE);
+
+    // Mask all legacy 8259 PIC interrupts so they don't interfere
+    out_portb(0x21, 0xFF);
+    out_portb(0xA1, 0xFF);
+
+    // Enable the LAPIC: set bit 8 of SVR and program spurious vector (0xFF)
+    lapic_write(LAPIC_SVR, lapic_read(LAPIC_SVR) | 0x1FF);
+
+    // Set Task Priority Register to 0 — accept all interrupt priorities
+    lapic_write(LAPIC_TPR, 0);
+}
+```
+
+### LAPIC read/write and EOI
+
+```c
+// apic.h / apic.c
+
+// Write a 32-bit value to LAPIC register `reg`.
+void lapic_write(uint32_t reg, uint32_t value);
+
+// Read a 32-bit value from LAPIC register `reg`.
+uint32_t lapic_read(uint32_t reg);
+
+// Signal End-of-Interrupt to the LAPIC (writes 0 to LAPIC_EOI).
+// Must be called by every IRQ handler before returning.
+void lapic_eoi(void);
+```
+
+### IOAPIC IRQ routing
+
+The I/O APIC translates physical device IRQ lines into IDT vector deliveries. `ioapic_set_irq()` programs one redirection table entry:
+
+```c
+// apic.h
+
+// Route hardware IRQ `irq` to IDT vector `vector`, delivering to APIC `apic_id`.
+void ioapic_set_irq(uint8_t irq, uint64_t apic_id, uint8_t vector);
+```
+
+aeryk uses this in `init_apic_timer()`:
+
+```c
+// main.c — inside init_apic_timer()
+ioapic_set_irq(1, 0, 33);  // IRQ 1 (PS/2 keyboard) → IDT vector 33
+```
+
+The keyboard driver then registers its handler with:
+
+```c
+irq_install_handler(1, keyboard_handler);  // IRQ index 1 maps to IDT vector 33
+```
+
+### APIC timer and scheduler tick
+
+After `init_apic()` sets up the LAPIC, `init_timer()` (called from `init_apic_timer()`) calibrates the APIC timer using the PIT as a reference:
+
+1. Arm the PIT for a known interval.
+2. Write a large initial count to `LAPIC_TIMER_INITCNT` and set `LAPIC_TIMER_DIV`.
+3. Wait for the PIT interval to elapse.
+4. Read `LAPIC_TIMER_CURCNT` to determine how many LAPIC ticks fit in that interval.
+5. Program the LAPIC timer in periodic mode with that calibrated count so it fires at a fixed frequency.
+
+Each LAPIC timer tick triggers an IRQ (routed through the IDT) that calls `mlfq_on_tick()` in the scheduler. This is how aeryk achieves preemptive multitasking: a running process is interrupted by the timer, the scheduler records the tick against the current process's quantum, and if the quantum is exhausted the process is demoted to a lower priority queue and a new process is selected.
+
+<Note>
+  Every IRQ handler — including the timer tick and the keyboard handler — must call `lapic_eoi()` before returning. The LAPIC will not deliver any further interrupts to the CPU until it receives an EOI for the current one. In aeryk, `isr_handler()` calls `lapic_eoi()` centrally for all IRQ vectors (32–47) before dispatching to the registered `irq_handlers[]` entry, so individual drivers do not need to issue their own EOI.
+</Note>

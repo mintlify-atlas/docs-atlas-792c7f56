@@ -1,0 +1,249 @@
+---
+title: "Memory management in aeryk: PMM, VMM, and slab allocator"
+sidebarTitle: "Memory"
+description: "aeryk's three-layer memory system: bitmap-based PMM with refcounting, 4-level paging VMM with COW fork, and a slab allocator for kernel heap allocation."
+---
+
+aeryk's memory management is divided into three cooperating layers. The Physical Memory Manager (PMM) tracks which 4 KiB frames are in use and implements reference counting for copy-on-write sharing. The Virtual Memory Manager (VMM) builds and manipulates 4-level page tables, creates per-process address spaces, and handles copy-on-write page faults. The slab allocator sits on top of both and provides variable-size `kmalloc`/`kfree` for general kernel heap use.
+
+```
+┌────────────────────────────────────────────┐
+│          kmalloc / kfree (slab)            │  kernel heap
+├────────────────────────────────────────────┤
+│      VMM — 4-level paging, COW fork        │  virtual address spaces
+├────────────────────────────────────────────┤
+│      PMM — bitmap + refcounts              │  physical frames
+└────────────────────────────────────────────┘
+```
+
+---
+
+## PMM — Physical Memory Manager
+
+The PMM is implemented in `kernel/src/arch/x86_64/pmm.c` and exposed through `pmm.h`. It manages all physical RAM using two parallel data structures: a flat bitmap (one bit per page frame) and a `uint16_t` refcount array (one entry per page frame). Both structures are placed together in the first usable physical region large enough to hold them, immediately after Limine's memory map is read.
+
+### Design
+
+- **Page size**: `PAGE_SIZE = 4096` bytes — one bit in the bitmap and one `uint16_t` in the refcount array per frame.
+- **Bitmap**: a `0` bit means the frame is free; a `1` bit means it is allocated or reserved. Initialised to all-ones (`0xFF` fill), then the usable pages are cleared.
+- **Refcounts**: a freshly allocated page starts at `refcount = 1`. `pmm_free_page()` decrements the refcount and only clears the bitmap bit once it reaches zero. This allows a physical frame to be shared between multiple process page tables (e.g., after `fork()`) without being reclaimed prematurely.
+- **`hhdm_offset`**: a globally visible `uint64_t` set by `init_pmm()` from the Limine HHDM response. Every subsystem that needs to convert a physical address to a kernel-accessible virtual address does so with `phys + hhdm_offset`.
+- **Physical page 0 reserved**: page frame 0 is permanently marked allocated (`bitmap_set(0)`, `refcounts[0] = 1`) because its physical address is `0`, which is indistinguishable from a `NULL` return value. No caller needs to check for that ambiguity.
+
+### API
+
+```c
+// pmm.h
+
+#define PAGE_SIZE 4096
+
+extern uint64_t hhdm_offset;
+
+// Sets up the bitmap and refcount array from the Limine memory map.
+// Must be called before any other PMM function.
+void init_pmm(void);
+
+// Scans the bitmap for a free frame, marks it allocated (refcount = 1),
+// and returns its physical address. Returns NULL if no frames are free.
+void *pmm_alloc_page(void);
+
+// Decrements the frame's refcount. Marks it free in the bitmap only
+// when the count reaches zero. Safe to call on shared (COW) frames.
+void pmm_free_page(void *page);
+
+// Increments the refcount on an already-allocated frame.
+// Used by vmm_clone_user_pagetable() when a frame becomes shared.
+void pmm_page_ref_inc(void *page);
+
+// Returns the current refcount of a frame.
+// Used by vmm_handle_cow_fault() to decide whether to copy or reclaim.
+uint16_t pmm_page_refcount(void *page);
+```
+
+<Tip>
+  The bitmap scan uses a `bitmap_index` cursor that resumes from the last allocation position rather than restarting from 0 every time. This keeps average allocation O(1) in the common case of sequential allocation and avoids scanning already-allocated low-memory pages repeatedly.
+</Tip>
+
+---
+
+## VMM — Virtual Memory Manager
+
+The VMM is implemented in `kernel/src/arch/x86_64/vmm.c` and exposed through `vmm.h`. It operates directly on x86_64 4-level page tables (PML4 → PDPT → PD → PT) and manages per-process virtual address spaces.
+
+### Page table structure
+
+x86_64 uses a four-level radix tree to translate a 64-bit virtual address to a physical address. Each level holds 512 8-byte entries indexed by 9-bit slices of the virtual address:
+
+```
+Virtual address (64 bits):
+  [63:48] sign-extension  [47:39] PML4  [38:30] PDPT  [29:21] PD  [20:12] PT  [11:0] offset
+```
+
+Intermediate entries (PML4/PDPT/PD) that are allocated on demand by `get_next_level()` are always created with `PTE_PRESENT | PTE_WRITABLE | PTE_USER` so they are accessible from both kernel and user space. The leaf PT entry carries the caller-supplied flags.
+
+### PTE flags
+
+```c
+// vmm.h
+
+#define PTE_PRESENT  (1ull << 0)   // page is mapped
+#define PTE_WRITABLE (1ull << 1)   // page is writable
+#define PTE_USER     (1ull << 2)   // accessible from ring 3
+#define PTE_NX       (1ull << 63)  // no-execute (not used yet in aeryk)
+#define PTE_COW      (1ull << 9)   // OS-defined: copy-on-write shared page
+```
+
+Bits 9–11 of a present PTE are ignored by the MMU and are available for OS use. `PTE_COW` occupies bit 9 and marks a page as shared between a parent and child after `fork()`.
+
+### Kernel-half sharing
+
+The 512 PML4 entries split the 64-bit address space in half: entries 0–255 cover user space (lower 128 TiB), entries 256–511 cover kernel space (upper 128 TiB). Every user page table is created by `vmm_new_user_pagetable()`, which copies entries 256–511 from the kernel PML4 into the new PML4. This means kernel code, the HHDM, and the framebuffer remain mapped regardless of which process's CR3 is loaded — no explicit kernel mapping is required on context switch.
+
+### API
+
+```c
+// vmm.h
+
+// Reads CR3 and stores the kernel PML4 pointer. Called once during boot.
+void init_vmm(void);
+
+// Maps virtual_addr → physical_addr in pml4 with the given PTE flags.
+// Allocates intermediate page-table pages as needed.
+void vmm_map_page(uint64_t *pml4, uint64_t virtual_addr,
+                  uint64_t physical_addr, uint64_t flags);
+
+// Returns the kernel PML4 pointer (set by init_vmm).
+uint64_t *vmm_get_kernel_pml4(void);
+
+// Allocates a new PML4 for a user process.
+// Copies kernel-half entries (256-511) from the kernel PML4.
+// Returns the HHDM virtual address of the new PML4, or NULL.
+uint64_t *vmm_new_user_pagetable(void);
+
+// Frees all physical frames mapped in the user half (entries 0-255)
+// of pml4, including all intermediate PDPT/PD/PT pages.
+// Does not touch the shared kernel half.
+void vmm_destroy_user_pagetable(uint64_t *pml4);
+
+// COW clone: shares all user-half leaf pages between src_pml4 and a new
+// PML4, downgrading writable pages to read-only + PTE_COW and bumping
+// their refcounts. Flushes the TLB before returning.
+uint64_t *vmm_clone_user_pagetable(uint64_t *src_pml4);
+
+// Called from the #PF handler for write faults.
+// If fault_vaddr maps a PTE_COW page: copies the frame (or reclaims
+// sole ownership) and restores PTE_WRITABLE. Returns 1 on success,
+// 0 if the fault was not a COW fault.
+int vmm_handle_cow_fault(uint64_t *pml4, uint64_t fault_vaddr);
+```
+
+---
+
+## Copy-on-write fork
+
+When a process calls `fork()`, aeryk avoids copying all mapped pages immediately. Instead, `vmm_clone_user_pagetable()` builds a new page table that shares the parent's physical frames:
+
+1. For each present leaf PTE in the parent's user half:
+   - If the page is currently **writable**: clear `PTE_WRITABLE`, set `PTE_COW` in both the parent's and child's PTE, and call `pmm_page_ref_inc()` to bump the shared frame's refcount.
+   - If the page is already **read-only**: share it without the COW marker (neither side can write it anyway).
+2. After building the child's page table, flush the TLB with a CR3 reload — the parent's now-read-only mappings must be visible immediately.
+
+When either process attempts to write to a COW page, a `#PF` fires. `isr_handler()` in `idt.c` catches write page faults (bit 1 of the error code set) and calls `vmm_handle_cow_fault()`:
+
+```c
+// Inside isr_handler() — idt.c
+if (frame->int_no == 14 && (frame->err_code & PF_ERR_WRITE) &&
+    current_process)
+{
+    uint64_t fault_vaddr;
+    asm volatile("mov %%cr2, %0" : "=r"(fault_vaddr));
+
+    uint64_t *pml4 = (uint64_t *)(current_process->cr3 + hhdm_offset);
+    if (vmm_handle_cow_fault(pml4, fault_vaddr)) {
+        return;  // fault resolved, retry the faulting instruction
+    }
+}
+```
+
+Inside `vmm_handle_cow_fault()`, the decision is:
+
+- **Refcount == 1** (sole owner): no other process maps this frame; simply restore `PTE_WRITABLE` and clear `PTE_COW` in place. No copy needed.
+- **Refcount > 1** (shared): allocate a new frame with `pmm_alloc_page()`, copy the page contents, update the faulting process's PTE to point at the new frame, and call `pmm_free_page()` to drop the reference on the old frame.
+
+In both cases `invlpg` is used to invalidate the specific TLB entry for the faulting address.
+
+<Note>
+  If `vmm_handle_cow_fault()` returns `0` (not a COW fault — for example, the process genuinely accessed an unmapped address), `isr_handler()` falls through to the standard fault handler, which kills the offending user process.
+</Note>
+
+---
+
+## Slab allocator
+
+The slab allocator lives in `kernel/src/arch/x86_64/slab.c` and is declared in `slab.h`. It provides `kmalloc`/`kfree` for variable-size kernel heap objects: `process_t` structs, page-table pointers, string buffers, and anything else the kernel needs to allocate dynamically after `init_slab()` runs.
+
+### Structure
+
+```c
+// slab.h
+
+struct slab_chunk {
+    struct slab_chunk *next;  // free-list pointer (overlays object data when free)
+};
+
+struct slab {
+    uint32_t magic;
+    struct slab *next;
+    struct slab *prev;
+    struct slab_cache *cache;    // back-pointer to owning cache
+    struct slab_chunk *free_list; // head of the free chunk list
+    size_t free_chunks;
+    size_t total_chunks;
+};
+
+struct slab_cache {
+    size_t object_size;          // size of objects in this cache
+    struct slab *slabs_partial;  // slabs with some free chunks
+    struct slab *slabs_free;     // slabs that are entirely free
+    struct slab *slabs_full;     // slabs with no free chunks
+};
+```
+
+Each `slab_cache` manages objects of a fixed size. `kmalloc()` selects the smallest cache whose `object_size` is ≥ the requested allocation, takes a chunk from the partial-slab free list (or allocates a new slab from the PMM if none is available), and returns a pointer. `kfree()` locates the owning slab via the pointer, pushes the chunk back onto the free list, and moves the slab between the partial/free/full lists as appropriate.
+
+### API
+
+```c
+// slab.h
+
+// Initialises slab caches. Must be called after init_pmm() and init_vmm().
+void init_slab(void);
+
+// Allocates at least `size` bytes from the matching slab cache.
+// Returns NULL if no slab page could be allocated from the PMM.
+void *kmalloc(size_t size);
+
+// Returns the object at `ptr` to its slab's free list.
+void kfree(void *ptr);
+```
+
+### Typical usage
+
+```c
+// Allocating a kernel object
+process_t *proc = (process_t *)kmalloc(sizeof(process_t));
+if (proc == NULL) {
+    // PMM exhausted — handle error
+    return NULL;
+}
+memset(proc, 0, sizeof(process_t));
+
+// ... use proc ...
+
+// Freeing it
+kfree(proc);
+```
+
+<Warning>
+  `kmalloc` and `kfree` are not thread-safe in the current aeryk implementation. They must only be called from kernel context with interrupts managed appropriately. Do not call them from an interrupt handler that could nest over a kernel `kmalloc` in progress.
+</Warning>

@@ -1,0 +1,75 @@
+---
+title: "aeryk: x86_64 hobby kernel written in C"
+sidebarTitle: "Introduction"
+description: "aeryk is a from-scratch x86_64 kernel in C: Limine-booted, with PMM/VMM, MLFQ scheduler, syscalls, VFS, ELF loader, and a userland shell."
+---
+
+aeryk is a hobby x86_64 operating system kernel written from scratch in C, booted via the [Limine](https://codeberg.org/Limine/Limine) bootloader. Starting from a bare framebuffer and a font renderer, it has grown into a system capable of managing physical and virtual memory, scheduling processes with a Multi-Level Feedback Queue (MLFQ), handling syscalls from Ring 3 userland, loading ELF binaries out of an initramfs, and running a minimal interactive shell — all without relying on any existing OS infrastructure.
+
+## What aeryk can do
+
+aeryk ships a complete path from power-on to a userland prompt:
+
+1. **Limine** loads the kernel ELF, the PSF1 font, and the initramfs CPIO archive.
+2. The kernel initialises the GDT, IDT, framebuffer TTY, serial port, PMM, VMM/paging, APIC timer, slab allocator, MLFQ scheduler, keyboard driver, and syscall interface — in that order.
+3. The initramfs is mounted as a read-only VFS, exposing `/bin/init`, `/bin/cat`, `/bin/sh`, `/bin/ls`, and several test programs.
+4. `/bin/exectest` and `/bin/sh` are spawned as Ring 3 ELF processes; the scheduler takes over and drops you into a `> ` prompt.
+
+From the shell you can run any binary in `/bin/` by name (e.g. `ls`, `cat hello.txt`).
+
+## Project timeline
+
+The kernel was built incrementally over the first half of 2026:
+
+| Date     | Milestone                               |
+| -------- | --------------------------------------- |
+| Jan 2026 | Bootloader setup with Limine            |
+| Feb 2026 | Framebuffer TTY and PSF1 font rendering |
+| Mar 2026 | Global Descriptor Table (GDT)           |
+| Apr 2026 | Interrupt Descriptor Table (IDT)        |
+| May 2026 | Memory Management Unit (MMU)            |
+| May 2026 | APIC and keyboard driver                |
+| May 2026 | Slab allocator                          |
+| Jun 2026 | MLFQ scheduler and processes            |
+| Jun 2026 | Serial driver                           |
+| Jul 2026 | Syscalls: spawn/wait, libc wrappers     |
+| Jul 2026 | Userland shell (`sh`)                   |
+
+## Current feature status
+
+Every item below is fully implemented and boots on QEMU today:
+
+- ✅ Boot via Limine (UEFI and BIOS)
+- ✅ Framebuffer TTY
+- ✅ PSF1 font rendering (cp850-8x16)
+- ✅ Global Descriptor Table (GDT)
+- ✅ Interrupt Descriptor Table (IDT)
+- ✅ Physical Memory Manager (PMM)
+- ✅ Virtual memory / paging (VMM)
+- ✅ APIC and APIC timer
+- ✅ PS/2 keyboard driver (wired to `sys_read` on fd 0, blocking, line-buffered)
+- ✅ Slab heap allocator (`kmalloc` / `kfree`)
+- ✅ MLFQ scheduler with context switching
+- ✅ Serial driver (COM1, used for GDB debugging)
+- ✅ Syscall interface (`sys_write`, `sys_exit`, `sys_open`, `sys_read`, `sys_close`, `sys_spawn`, `sys_wait`, `fork`, `execve`)
+- ✅ Initramfs (CPIO archive loaded by Limine)
+- ✅ Virtual File System (VFS)
+- ✅ ELF loader (Ring 3 userland processes)
+- ✅ libc (`string.c`, `stdio.c`, `unistd.c`, `stdlib.c`)
+- ✅ Userland programs: `init`, `cat`, `sh`, `ls`, `forktest`, `exectest`, `crashtest`
+
+## Where to go next
+
+Ready to get aeryk running? Head to the build guide to compile the kernel, then follow the QEMU guide to boot it:
+
+<CardGroup cols={3}>
+  <Card title="Build aeryk" icon="hammer" href="/building">
+    Install the cross-compiler toolchain and build a bootable ISO with a single `make` command.
+  </Card>
+  <Card title="Run in QEMU" icon="play" href="/running">
+    Boot the ISO under QEMU with UEFI or BIOS firmware and reach the interactive shell.
+  </Card>
+  <Card title="Architecture overview" icon="map" href="/architecture/overview">
+    Explore the kernel subsystems: memory layout, scheduler design, syscall ABI, and VFS.
+  </Card>
+</CardGroup>

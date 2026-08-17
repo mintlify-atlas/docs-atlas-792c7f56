@@ -1,0 +1,118 @@
+---
+title: "Testing aeryk kernel subsystems with Unity"
+sidebarTitle: "Testing"
+description: "aeryk uses the Unity C testing framework to unit-test GDT, IDT, PMM, VMM, slab allocator, scheduler, and syscall subsystems with stub-based isolation."
+---
+
+aeryk uses the [Unity](https://github.com/ThrowTheSwitch/Unity) C unit testing framework to validate kernel subsystems directly on the host machine — no QEMU, no cross-compiler, no bootable image required. Each test suite compiles the real kernel source file under test together with a lightweight stub file that fakes out dependencies (like `pmm_alloc_page` or `schedule`), giving you fast, repeatable pass/fail results at the C function level.
+
+## Running the tests
+
+Unity is cloned automatically the first time you run `make test`, so there is nothing extra to install.
+
+**Linux:**
+
+```sh
+make test
+```
+
+**macOS** (cross-toolchain required for the kernel build, but tests use the host compiler):
+
+```sh
+make TOOLCHAIN_PREFIX=x86_64-elf- test
+```
+
+The `test` target builds every suite into `tests/bin/`, then executes each binary in sequence. Unity prints a pass/fail summary to stdout for every `RUN_TEST` call.
+
+<Note>
+Tests compile and run entirely on the host using `$(HOST_CC)` (your system `cc`). No QEMU session is needed, and no cross-compiler is required for the test step itself.
+</Note>
+
+## TEST_CFLAGS
+
+The test binaries are compiled with a special set of flags defined in `GNUmakefile`:
+
+```makefile
+override TEST_CFLAGS := $(HOST_CFLAGS) -std=gnu11 \
+    -I kernel/src/arch/x86_64/include \
+    -I kernel/src \
+    -I kernel/limine-protocol/include \
+    -I abi/include \
+    -I unity/src
+```
+
+These `-I` paths make kernel headers (like `idt.h`, `pmm.h`, `slab.h`) available to the host compiler without needing a sysroot or cross-toolchain prefix. `HOST_CFLAGS` is `-g -O2 -pipe`, so test binaries are debuggable with a regular `gdb`.
+
+## Test suites
+
+### test_gdt
+
+`tests/test_gdt.c` validates the Global Descriptor Table entry packing logic in `kernel/src/arch/x86_64/gdt.c`. Tests check that `set_gdt_gate` correctly splits a 32-bit base address across `base_low`, `base_middle`, and `base_high` fields and combines limit and flag nibbles properly. The TSS setup tests (`test_write_tss_lower_descriptor`, `test_write_tss_upper_descriptor_holds_high_base_bits`, `test_write_tss_initializes_tss_entry`) verify that the 64-bit TSS descriptor is written across two consecutive 8-byte GDT slots with the correct access byte (`0x89`) and that `tss_entry.rsp0` is initialised from the supplied stack address. `test_set_kernel_stack_updates_rsp0` confirms that `set_kernel_stack()` keeps `rsp0` in sync at runtime. The stub file `tests/stub_gdt.c` provides no-op implementations of `gdt_flush` and `tss_flush` so the linker is satisfied without needing assembly thunks.
+
+### test_idt
+
+`tests/test_idt.c` validates IDT gate packing and the IRQ dispatch table in `kernel/src/arch/x86_64/idt.c`. The gate-packing tests (`test_setIdtGate_packs_base_correctly`, `test_setIdtGate_sets_selector_and_attributes`, `test_setIdtGate_reserved_is_zero`, `test_setIdtGate_ist_masked_to_3_bits`) verify that a 64-bit handler address is correctly split across `base_low`, `base_middle`, and `base_high`, that the selector and `type_attributes` byte are stored verbatim, that the `reserved` field stays zero, and that the IST field is masked to 3 bits. The IRQ dispatch tests (`test_irq_install_and_dispatch`, `test_irq_uninstall_stops_dispatch`, `test_irq_reinstall_replaces_handler`, `test_irq_handler_receives_correct_frame`, `test_irq_multiple_independent_slots`) exercise `irq_install_handler`/`irq_uninstall_handler` and confirm that `isr_handler` routes an `interrupt_frame` to the correct registered callback. LAPIC EOI tests (`test_irq_sends_lapic_eoi_once_per_dispatch`, `test_irq_sends_lapic_eoi_even_without_handler`) use a counter stub to assert that `lapic_eoi()` is called exactly once per dispatched IRQ vector, even when no handler is registered. The shared stub file `tests/stubs.c` provides no-op ISR thunks (`isr0`–`isr47`), a stub `print`, a stub `lapic_eoi` with a call counter, and a stub `pmm_alloc_page` backed by an 8-page static pool.
+
+### test_pmm
+
+`tests/test_pmm.c` exercises the physical memory manager in `kernel/src/arch/x86_64/pmm.c`. Because `init_pmm()` reads Limine memory-map and HHDM responses, `tests/stub_pmm.c` provides a fake 1024-page usable memory region (a static 4 MiB host buffer) and patches the HHDM offset to point directly at it. The tests then validate the invariants of the public API: `test_alloc_returns_page_aligned_address_in_range` confirms alignment and range; `test_consecutive_allocations_are_distinct` ensures the allocator never hands out the same page twice; `test_freeing_most_recent_allocation_makes_it_immediately_reusable` checks that a freed page is immediately recycled on the next allocation; `test_double_free_does_not_corrupt_allocator` verifies that freeing the same page twice is a safe no-op; and `test_alloc_returns_null_once_memory_is_exhausted` drains the entire pool and confirms that further allocations return `NULL` without wrapping.
+
+### test_vmm
+
+`tests/test_vmm.c` validates `vmm_map_page` in `kernel/src/arch/x86_64/vmm.c`. The stub `tests/stub_vmm.c` (embedded in `tests/stubs.c`) replaces `pmm_alloc_page` with an 8-page static pool so page-table allocation can be tracked and exhausted deterministically. `test_map_page_builds_full_table_chain` walks the PML4 → PDPT → PD → PT chain after a single mapping and asserts every intermediate level is present and that the final PT entry equals `pa | FLAGS`. `test_map_page_intermediate_levels_get_rwu_flags` checks that every intermediate entry carries `PTE_PRESENT | PTE_WRITABLE | PTE_USER`. `test_map_page_reuses_tables_for_addresses_in_same_region` maps two pages 4 KiB apart and confirms that the PMM pool count does not grow on the second mapping. `test_map_page_distinct_pml4_slots_get_distinct_chains` confirms that two virtual addresses that differ in their PML4 index produce separate PDPT pointers. `test_map_page_bails_out_when_pmm_exhausted` deliberately drains the 8-page pool and asserts that a ninth mapping does not crash and leaves `pml4[8]` with `PTE_PRESENT` clear.
+
+### test_slab
+
+`tests/test_slab.c` exercises the slab allocator (`kmalloc`/`kfree`) in `kernel/src/arch/x86_64/slab.c`. `tests/stub_slab.c` provides a 16-page PMM pool with separate `pool_used` and `pool_freed` counters so tests can verify when pages are allocated from and returned to the PMM. Size-class tests check that `kmalloc(0)` and `kmalloc(2049)` return `NULL`, while `kmalloc(2048)` succeeds. Lazy allocation is verified by `test_kmalloc_allocates_backing_page_lazily`, which confirms that no PMM page is touched before the first `kmalloc`. `test_kmalloc_packs_small_allocations_into_one_page` shows that two 16-byte allocations share a single backing page. Free-list behaviour is tested by `test_kfree_reuses_chunk_lifo`, which checks LIFO reuse of a freed slot. Safety tests (`test_kfree_rejects_pointer_without_slab_magic`, `test_kfree_ignores_null`) confirm that passing an unrelated stack pointer or `NULL` to `kfree` does not corrupt the allocator. Finally, `test_kmalloc_starts_new_slab_once_current_is_full` and `test_kfree_returns_fully_freed_slab_to_pmm` validate slab lifecycle: a full slab triggers a new PMM page allocation, and freeing every chunk in a slab returns the backing page to the PMM.
+
+### test_scheduler
+
+`tests/test_scheduler.c` exercises the Multi-Level Feedback Queue (MLFQ) scheduler in `kernel/src/arch/x86_64/scheduler.c`. `tests/stub_scheduler.c` provides stub `current_process`, `idle_process`, and a `schedule()` call counter so test code can inspect how many preemptions occurred. Enqueue tests (`test_enqueue_ignores_null_and_dead`, `test_enqueue_sets_ready_state`) validate guard conditions at queue entry. Pick-next tests (`test_pick_next_returns_fifo_order_within_queue`, `test_pick_next_prefers_higher_priority_queue`, `test_pick_next_unlinks_picked_process`) confirm FIFO ordering within a queue, correct priority-queue selection, and that picked processes are fully unlinked from the queue. Tick tests exercise `mlfq_on_tick`: `test_on_tick_demotes_after_quantum_expires` checks that a process in queue 0 (quantum 2 ticks) is demoted to priority 1 after consuming its quantum; `test_on_tick_caps_priority_at_lowest_queue` confirms the lowest queue (priority 3, quantum 8) re-enqueues at the same level instead of going out of bounds; `test_on_tick_boosts_all_after_interval` simulates 100 ticks and checks that every enqueued and running process is reset to priority 0 with `ticks_executed = 0`; and `test_on_tick_ignores_non_running_current` verifies that a blocked current process is not ticked.
+
+### test_syscall
+
+`tests/test_syscall.c` validates `syscall_handler_c` in `kernel/src/arch/x86_64/syscall.c`. `tests/stub_syscall.c` stubs out `print` (counting calls and capturing the last string), `keyboard_read` (returning a configurable value and recording arguments), `schedule`, and the MSR read/write helpers `rdmsr`/`wrmsr`. Tests build a minimal `syscall_frame` using `rax` for the syscall number and `rdi`/`rsi`/`rdx` for arguments. `test_sys_read_from_stdin_delegates_to_keyboard_read` confirms that `sys_read` (syscall 0) on fd 0 calls `keyboard_read` with the correct buffer and count and propagates its return value into `frame.rax`. `test_sys_read_from_non_stdin_returns_error` checks that reading from a non-stdin fd skips `keyboard_read` and returns `-1`. `test_sys_write_to_stdout_prints_and_returns_length` verifies that `sys_write` (syscall 1) on fd 1 calls `print` and returns the byte count. `test_unknown_syscall_warns_and_returns_error` checks that an unrecognised syscall number prints a warning and returns `-1`. `sys_exit` (syscall 60) is intentionally excluded because its `for(;;) asm("hlt")` loop would hang the host test runner.
+
+## Stub files
+
+Every test suite is paired with a stub file that satisfies external symbol references without pulling in the full kernel:
+
+| Test binary       | Stub file(s)            | Key fakes                                                         |
+| ----------------- | ----------------------- | ----------------------------------------------------------------- |
+| `test_idt`        | `tests/stubs.c`         | `print`, `lapic_eoi` (counted), `pmm_alloc_page` (8-page pool), `isr0`–`isr47` no-ops |
+| `test_gdt`        | `tests/stub_gdt.c`      | `gdt_flush`, `tss_flush` (no-ops); `print`                        |
+| `test_pmm`        | `tests/stub_pmm.c`      | Limine memmap/HHDM responses backed by a 4 MiB host buffer        |
+| `test_vmm`        | `tests/stubs.c`         | `pmm_alloc_page` (8-page static pool), `pmm_free_page` (no-op)   |
+| `test_slab`       | `tests/stub_slab.c`     | `pmm_alloc_page`/`pmm_free_page` with use/free counters           |
+| `test_scheduler`  | `tests/stub_scheduler.c`| `current_process`, `idle_process`, `schedule` (counted)           |
+| `test_syscall`    | `tests/stub_syscall.c`  | `print` (counted), `keyboard_read` (configurable return), `rdmsr`/`wrmsr` |
+
+## Adding a new test suite
+
+1. Create `tests/test_<module>.c` with Unity `RUN_TEST` calls.
+2. Create `tests/stub_<module>.c` with minimal fakes for any symbols your module calls outside its own file.
+3. Add a compile-and-run rule to the `test` target in `GNUmakefile`:
+
+```makefile
+$(HOST_CC) $(TEST_CFLAGS) tests/stub_<module>.c tests/test_<module>.c \
+    kernel/src/arch/x86_64/<module>.c unity/src/unity.c \
+    -o tests/bin/test_<module>
+./tests/bin/test_<module>
+```
+
+4. Run `make test` — Unity will report any failures immediately.
+
+## Test output
+
+Each binary prints a standard Unity summary to stdout:
+
+```
+tests/test_idt.c:25:test_setIdtGate_packs_base_correctly:PASS
+tests/test_idt.c:33:test_setIdtGate_sets_selector_and_attributes:PASS
+...
+-----------------------
+14 Tests 0 Failures 0 Ignored
+OK
+```
+
+A non-zero exit code is returned on any failure, so `make test` stops and highlights the failing suite.

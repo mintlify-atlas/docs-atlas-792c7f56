@@ -1,0 +1,163 @@
+---
+title: "VFS and initramfs filesystem in aeryk"
+sidebarTitle: "Filesystem"
+description: "aeryk mounts a CPIO initramfs at boot into an in-memory VFS tree, providing file lookup, directory traversal, and read access to userland ELF binaries."
+---
+
+aeryk uses a two-layer filesystem design. At the bottom is an **initramfs** parser that reads a CPIO archive handed to the kernel by Limine at boot time. On top of that sits a lightweight **Virtual Filesystem (VFS)** — a simple in-memory tree of nodes. The initramfs parser calls into the VFS to create nodes for every file and directory it finds in the archive, so by the time `main()` reaches userspace all binaries are already addressable by path. There is no block device, no disk driver, and no persistent storage — everything lives in RAM for the lifetime of the kernel.
+
+## VFS
+
+### The `vfs_node_t` struct
+
+```c
+typedef enum { VFS_FILE, VFS_DIRECTORY } vfs_node_type_t;
+
+typedef struct vfs_node {
+    char            name[128];
+    vfs_node_type_t type;
+    uint32_t        size;
+    void           *data;     // pointer to file contents (NULL for directories)
+
+    struct vfs_node *parent;
+    struct vfs_node *children; // first child (singly-linked via next)
+    struct vfs_node *next;     // next sibling
+} vfs_node_t;
+
+extern vfs_node_t *vfs_root;
+```
+
+Every node stores its name as a fixed 128-byte array. Files set `data` to the address of their content inside the initramfs memory region and `size` to the byte count. Directories leave `data` as `NULL` and build their subtree through the `children`/`next` sibling chain.
+
+### VFS API
+
+#### `init_vfs`
+
+```c
+void init_vfs(void);
+```
+
+Allocates a single root node (`"/"`, type `VFS_DIRECTORY`) and assigns it to `vfs_root`. Called once at the start of `initramfs_init()`.
+
+#### `vfs_create_node`
+
+```c
+vfs_node_t *vfs_create_node(const char *name, vfs_node_type_t type);
+```
+
+Allocates and zeroes a `vfs_node_t` from the slab allocator, then copies characters from `name` until it hits a `/`, a NUL, or 127 bytes. Nodes are not automatically attached to the tree — callers must call `vfs_add_child()`.
+
+#### `vfs_add_child`
+
+```c
+void vfs_add_child(vfs_node_t *parent, vfs_node_t *child);
+```
+
+Sets `child->parent = parent` and prepends `child` to `parent->children` (newest child first). Directory entries are therefore visited in reverse insertion order when walking `children`.
+
+#### `vfs_find_node`
+
+```c
+vfs_node_t *vfs_find_node(vfs_node_t *parent, const char *path);
+```
+
+Resolves a path relative to `parent` by splitting on `/` and recursively descending. Leading and repeated slashes are stripped. Returns the matching node or `NULL` if any path component does not exist. The syscall layer passes `vfs_root` as the starting node for absolute paths:
+
+```c
+// inside sys_open:
+vfs_node_t *node = vfs_find_node(vfs_root, path);
+```
+
+#### `create_directories`
+
+```c
+vfs_node_t *create_directories(const char *path);
+```
+
+The `mkdir -p` equivalent. Walks `path` component by component from `vfs_root`, creating any missing intermediate `VFS_DIRECTORY` nodes along the way. Returns a pointer to the deepest directory created or found. Used by `initramfs_init()` when populating nested paths such as `/bin/init`.
+
+## Initramfs (CPIO)
+
+### CPIO newc format
+
+aeryk's initramfs is packaged as a **CPIO newc** archive (sometimes called `cpio -H newc`). Each entry starts with a fixed-layout ASCII header:
+
+```c
+#define MAGIC_NEWC "070701"   // standard newc
+#define MAGIC_CRC  "070702"   // newc with CRC
+
+struct cpio_newc_header {
+    char c_magic[6];      // "070701" or "070702"
+    char c_ino[8];        // inode number (hex ASCII)
+    char c_mode[8];       // file mode/type (hex ASCII)
+    char c_uid[8];
+    char c_gid[8];
+    char c_nlink[8];
+    char c_mtime[8];
+    char c_filesize[8];   // file data size in bytes (hex ASCII)
+    char c_devmajor[8];
+    char c_devminor[8];
+    char c_rdevmajor[8];
+    char c_rdevminor[8];
+    char c_namesize[8];   // length of filename including NUL (hex ASCII)
+    char c_check[8];
+} __attribute__((packed));
+```
+
+All numeric fields are 8-character uppercase hex ASCII strings. The filename immediately follows the header; both the header + filename and the file data are individually padded to 4-byte alignment.
+
+### `initramfs_init`
+
+```c
+void initramfs_init(void *base_address, size_t size);
+```
+
+The main entry point for mounting the initramfs. It:
+
+1. Calls `init_vfs()` to create the root node.
+2. Iterates through the CPIO archive one entry at a time, stopping when it encounters the sentinel entry `"TRAILER!!!"` or an invalid magic.
+3. Strips a leading `./` prefix from every filename so paths are rooted at `/`.
+4. Calls `create_directories()` to ensure parent directories exist.
+5. Creates a `VFS_DIRECTORY` node for directory entries (`c_mode & 0xF000 == 0x4000`).
+6. Creates a `VFS_FILE` node for regular file entries (`c_mode & 0xF000 == 0x8000`), setting `node->data` to the address of the file's data within the still-mapped CPIO memory region and `node->size` to the parsed `c_filesize`.
+
+The archive data itself is **not copied** — `data` pointers remain into Limine's module memory.
+
+### Boot integration
+
+Limine loads the initramfs as a boot module. `main.c` locates it by suffix:
+
+```c
+// pseudocode — actual call in main.c
+struct limine_file *mod = find_module_by_suffix(".cpio");
+initramfs_init(mod->address, mod->size);
+```
+
+### Contents
+
+The initramfs shipped with aeryk provides:
+
+| Path            | Description                           |
+|-----------------|---------------------------------------|
+| `/bin/init`     | PID 1 — spawns a shell                |
+| `/bin/sh`       | Minimal interactive shell             |
+| `/bin/cat`      | Print file to stdout                  |
+| `/bin/ls`       | List directory contents               |
+| `/bin/forktest` | Fork/wait regression test             |
+| `/bin/exectest` | Exec regression test                  |
+| `/bin/crashtest`| Intentional fault for fault handling  |
+| `/hello.txt`    | Sample text file                      |
+
+## How syscalls use the VFS
+
+| Syscall       | VFS operation |
+|---------------|---------------|
+| `sys_open`    | `vfs_find_node(vfs_root, path)` — allocates a free slot in `fd_table` |
+| `sys_read`    | Copies bytes from `node->data + fd->offset`; advances `fd->offset` |
+| `sys_write`   | Writes to `node->data + fd->offset` (for writable nodes) |
+| `sys_readdir` | Walks `node->children` chained via `next`, returning one entry per call |
+| `sys_execve`  | Passes the resolved `vfs_node_t *` to `elf_load()` |
+
+<Note>
+The VFS is entirely in-memory. There is no disk, no block cache, and no write-back. File `data` pointers point directly into the initramfs memory region provided by Limine. Writes to a file node modify that region in place; nothing is ever flushed to persistent storage because no persistent storage exists. A kernel reboot reloads the original CPIO from the bootloader.
+</Note>

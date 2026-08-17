@@ -1,0 +1,185 @@
+---
+title: "Userland in aeryk: libc, ELF programs, and the build pipeline"
+sidebarTitle: "Overview"
+description: "How aeryk builds ring-3 ELF binaries with a minimal libc, packages them into a CPIO initramfs, and makes them available to the kernel's VFS at /bin/."
+---
+
+Userland in aeryk is the layer of software that runs at **CPL3 (ring 3)** — below the kernel's CPL0 privilege level and separated from it by the page-table user bit (`PTE_USER`). Every program in `userland/` is compiled into a static, position-dependent ELF64 binary, linked against a purpose-built minimal libc, and packaged into a CPIO initramfs that the kernel's VFS exposes at `/bin/`. This page explains how those pieces fit together: the compile-and-link pipeline, the compiler flags that keep userland freestanding, and how to add a new program.
+
+## What "userland" means in aeryk
+
+Each userland process is an ELF64 executable that:
+
+- Runs at **CPL3** — the CPU prevents it from executing privileged instructions such as `cli`, `hlt`, or direct port I/O.
+- Lives in its own virtual address space. Page-table entries for user memory carry `PTE_USER`; kernel mappings do not. A CPL3 access to a non-user page triggers a page fault that the kernel handles by killing the offending process.
+- Communicates with the kernel exclusively through the `syscall` instruction using the Linux-compatible syscall numbers defined in `abi/include/abi/syscall.h`.
+- Is loaded from `/bin/<name>` in the kernel's in-memory VFS, which is backed by the CPIO initramfs.
+
+<Note>
+aeryk does not yet implement separate per-process page tables with full ASLR. The user-bit isolation is the primary CPL3 protection mechanism at this stage of development.
+</Note>
+
+## The build pipeline
+
+The build is driven entirely by `GNUmakefile`. Here is the full chain from source to bootable ISO:
+
+### Step 1 — Compile each `userland/*.c`
+
+```makefile
+obj-userland/%.c.o: userland/%.c
+    mkdir -p $(dir $@)
+    $(USER_CC) $(USERLAND_CFLAGS) -c $< -o $@
+```
+
+`USER_CC` resolves to `$(TOOLCHAIN_PREFIX)gcc`, which defaults to `gcc` when no prefix is set or `x86_64-elf-gcc` when a cross-toolchain prefix is exported.
+
+### Step 2 — Build `libc.a`
+
+All libc sources are compiled with the same `USERLAND_CFLAGS` and archived into a single static library:
+
+```makefile
+USERLAND_LIBC_SRCS := \
+    libc/stdlib/exit.c \
+    libc/unistd.c \
+    libc/stdio/putchar.c \
+    libc/stdio/puts.c \
+    libc/stdio/printf.c \
+    libc/string/strlen.c \
+    libc/string/strcmp.c \
+    libc/string/string.c
+
+obj-userland/libc.a: $(USERLAND_LIBC_OBJS)
+    $(USER_AR) rcs $@ $^
+```
+
+### Step 3 — Assemble `crt0.o`
+
+The C runtime entry point lives in `kernel/src/arch/x86_64/crt0.asm` and is assembled with NASM:
+
+```makefile
+obj-userland/crt0.o: kernel/src/arch/x86_64/crt0.asm
+    nasm -f elf64 $< -o $@
+```
+
+`crt0.asm` provides the `_start` symbol that the ELF loader jumps to. It sets up any necessary state, calls `main()`, then calls `exit()` with `main`'s return value so that a `return` from `main` is always safe.
+
+### Step 4 — Link each ELF binary
+
+Each program object file is linked against `crt0.o` and `libc.a` using `userland/linker.lds`:
+
+```makefile
+userland/%.elf: obj-userland/%.c.o userland/linker.lds obj-userland/crt0.o obj-userland/libc.a
+    $(USER_LD) -nostdlib -static -m elf_x86_64 -T userland/linker.lds \
+        obj-userland/crt0.o $< obj-userland/libc.a -o $@
+```
+
+The linker script loads the binary at a fixed virtual base of **`0x400000`** and lays out three `PT_LOAD` segments:
+
+```lds
+OUTPUT_FORMAT(elf64-x86-64)
+ENTRY(_start)
+
+PHDRS
+{
+  text   PT_LOAD FLAGS(5); /* R + X */
+  rodata PT_LOAD FLAGS(4); /* R */
+  data   PT_LOAD FLAGS(6); /* R + W */
+}
+
+SECTIONS
+{
+  . = 0x400000;
+
+  .text   : { *(.text .text.*)   } :text
+  .rodata : { *(.rodata .rodata.*) } :rodata
+  .data   : { *(.data .data.*)   } :data
+  .bss    : { *(.bss .bss.*) *(COMMON) } :data
+}
+```
+
+`-nostdlib`, `-static`, and `-fno-pie` together ensure no host libc or dynamic linker artifacts leak into the binary.
+
+### Step 5 — Pack into `initramfs.cpio`
+
+All `.elf` outputs are copied into `initramfs_root/bin/` and archived in **CPIO newc** format:
+
+```makefile
+initramfs.cpio: $(USERLAND_ELFS)
+    mkdir -p initramfs_root/bin
+    echo "Hello from the aeryk cpio initramfs!" > initramfs_root/hello.txt
+    # Copy each .elf to initramfs_root/bin/<name> (strip .elf extension)
+    cd initramfs_root && find . | cpio -o -H newc > ../initramfs.cpio
+```
+
+### Step 6 — Include in the bootable ISO
+
+The CPIO archive is placed at `iso_root/boot/initramfs.cpio` and referenced as a Limine module in `boot/limine.conf`. When the kernel boots, Limine passes the module's address and size via the Limine protocol; the kernel's VFS layer parses the CPIO and mounts the entries under `/`.
+
+## `USERLAND_CFLAGS` highlights
+
+The full flag set (from `GNUmakefile`) that every userland source — both libc and programs — is compiled with:
+
+```makefile
+override USERLAND_CFLAGS := -g -O2 -pipe \
+    -m64 -march=x86-64 -mabi=sysv \
+    -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
+    -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
+    -Ikernel/freestnd-c-hdrs/include \
+    -Ilibc/include \
+    -Iabi/include
+```
+
+| Flag | Reason |
+|---|---|
+| `-ffreestanding` | No implicit host libc; enables use of freestanding headers only |
+| `-fno-stack-protector` | No `__stack_chk_guard` — the symbol isn't provided |
+| `-fno-pic -fno-pie` | Flat non-relocatable binary; matches the `0x400000` base in `linker.lds` |
+| `-mno-red-zone` | Prevents use of the 128-byte red zone below RSP; required for x86_64 ring-3 code that may be interrupted |
+| `-mno-sse -mno-sse2 -mno-mmx -mno-80387` | Disables all FP/SIMD — the kernel does not save/restore SSE state on context switches (yet) |
+
+## Available programs
+
+Seven programs ship in `USERLAND_PROGS`:
+
+| Program | Source | Purpose |
+|---|---|---|
+| `init` | `userland/init.c` | First userland process; prints a banner and reads `/hello.txt` |
+| `sh` | `userland/sh.c` | Interactive shell with fork/exec |
+| `cat` | `userland/cat.c` | Print a file's contents to stdout |
+| `ls` | `userland/ls.c` | List a directory using `SYS_readdir` |
+| `forktest` | `userland/forktest.c` | Validates fork() and copy-on-write isolation |
+| `exectest` | `userland/exectest.c` | Validates execve() by replacing a child's image |
+| `crashtest` | `userland/crashtest.c` | Validates per-process fault isolation (div-by-zero, `ud2`, null deref) |
+
+## Adding a new userland program
+
+Adding a new program requires exactly **two** changes — no new Makefile rules needed:
+
+1. Add its name to `USERLAND_PROGS` in `GNUmakefile`:
+
+```makefile
+override USERLAND_PROGS := init cat sh ls forktest exectest crashtest myprogram
+```
+
+2. Create `userland/myprogram.c` with a `main()` function:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(int argc, char **argv) {
+    printf("hello from myprogram!\n");
+    return 0;
+}
+```
+
+The Makefile's pattern rules automatically compile `userland/myprogram.c` → `obj-userland/myprogram.c.o` → `userland/myprogram.elf` → `initramfs_root/bin/myprogram` → `initramfs.cpio`.
+
+<CardGroup cols={2}>
+  <Card title="libc Reference" icon="book" href="/userland/libc">
+    Full reference for every implemented libc function: stdio, stdlib, string, and unistd syscall wrappers.
+  </Card>
+  <Card title="Programs" icon="terminal" href="/userland/programs">
+    Behavioral reference for sh, cat, ls, init, forktest, exectest, and crashtest.
+  </Card>
+</CardGroup>

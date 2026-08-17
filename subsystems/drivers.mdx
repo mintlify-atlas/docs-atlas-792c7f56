@@ -1,0 +1,207 @@
+---
+title: "Keyboard, serial, APIC timer, and TTY drivers in aeryk"
+sidebarTitle: "Drivers"
+description: "aeryk's hardware drivers: PS/2 keyboard wired to stdin, APIC timer driving the scheduler, serial port for GDB, and framebuffer TTY with PSF1 font."
+---
+
+aeryk includes four hardware drivers that collectively cover user input, kernel debug output, scheduler timing, and console display. The keyboard driver translates PS/2 scancodes into ASCII characters and blocks the calling process until input is ready. The serial driver routes kernel `print()` output to a host terminal. The APIC timer fires the periodic interrupts that drive the MLFQ scheduler. The TTY driver renders text onto a Limine-provided linear framebuffer using an 8×16 PSF1 bitmap font.
+
+## Keyboard driver
+
+### PS/2 wiring and IRQ
+
+The keyboard is a classic 8042-compatible PS/2 controller. Its data register sits at I/O port `0x60` and its status/command register at `0x64`. Keypress events arrive as hardware interrupt IRQ1, which the IOAPIC routes to IDT vector 33:
+
+```c
+// During APIC initialisation:
+ioapic_set_irq(1, apic_id, 33); // IRQ1 → IDT vector 33
+```
+
+`init_keyboard()` then installs the handler:
+
+```c
+void init_keyboard(void);
+```
+
+The function reads the i8042 command byte, sets the keyboard-interrupt-enable bit (`0x01`), enables the PC-compatible translation bit (`0x40`), clears the keyboard-disable bit (`0x10`), and writes the byte back before registering `on_irq1` as the IRQ1 handler via `irq_install_handler(1, on_irq1)`.
+
+### Scancode-to-ASCII translation
+
+`on_irq1` reads the raw scancode from port `0x60`. Only make-codes (bit 7 clear) are processed; break-codes (key release, bit 7 set) are ignored. Scancodes are mapped to ASCII with a fixed 128-entry table:
+
+```c
+const char kbd_us[128] = {
+    0,   27,  '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-',
+    '=', '\b','\t','q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p',
+    '[', ']', '\n', 0,  'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l',
+    /* … */
+};
+```
+
+A decoded character is echoed to the TTY via `print()` and pushed into a 256-byte circular ring buffer (`kbd_buf`).
+
+### Line-buffered blocking reads
+
+```c
+int keyboard_read(char *buf, int count);
+```
+
+Called by `sys_read(fd=0, …)` for stdin. It loops, attempting to pop characters from `kbd_buf`. If the buffer is empty, the current process is moved to `PROCESS_BLOCKED`, appended to an internal `kbd_wait_head`/`kbd_wait_tail` queue that borrows the `queue_next`/`queue_prev` fields of `process_t`, and `schedule()` is called so another process can run. Reading stops early when a `'\n'` is encountered, giving line-buffered behaviour.
+
+When `on_irq1` pushes a new character into `kbd_buf`, it immediately dequeues the first waiting process and calls `mlfq_enqueue()` on it, waking it up for its next scheduler turn.
+
+<Note>
+The `cli`/`sti` pair around the empty-check and `kbd_wait_enqueue()` call in `keyboard_read()` closes a race window: without it, an IRQ firing between the empty-check and the enqueue could wake the process before it had joined the wait queue, causing it to sleep forever.
+</Note>
+
+## Serial driver
+
+### COM1 configuration
+
+```c
+void init_serial(void);
+```
+
+Configures COM1 (base I/O port `0x3F8`) at 38400 baud, 8 data bits, no parity, 1 stop bit. The initialisation sequence follows the standard OSDev pattern: disable interrupts, enable DLAB to set the baud divisor, set data format, enable FIFO, and set modem control lines.
+
+### Output functions
+
+```c
+void serial_putchar(char c);
+void serial_print(const char *c);
+```
+
+`serial_putchar` busy-waits on `is_transmit_empty(COM1)` before writing a byte to port `0x3F8`. `serial_print` is a simple wrapper that calls `serial_putchar` for each character of a NUL-terminated string.
+
+```c
+int is_transmit_empty(int port); // returns nonzero when UART THRE bit is set
+```
+
+The kernel's `print()` function calls `serial_print()` in addition to rendering on the framebuffer, so every console message is mirrored to the host.
+
+<Tip>
+To capture kernel output in a terminal while developing, start QEMU with `-serial stdio`. For source-level kernel debugging, add `-s -S` to pause at startup and connect with:
+
+```bash
+gdb kernel.elf \
+  -ex 'target remote :1234' \
+  -ex 'break kmain' \
+  -ex 'continue'
+```
+
+The `make debug` target in the aeryk build system sets these flags automatically.
+</Tip>
+
+## APIC timer
+
+### Initialisation
+
+```c
+void init_apic(void);   // defined in apic.h / apic.c
+void init_timer(void);  // defined in timer.h / timer.c
+```
+
+`init_apic()` identity-maps the LAPIC MMIO region at `0xFEE00000` and the IOAPIC at `0xFEC00000` into the virtual address space, masks all IOAPIC redirection entries, and enables the LAPIC by setting the Spurious Interrupt Vector Register (`LAPIC_SVR`).
+
+`init_timer()` calibrates the APIC timer's frequency using the legacy PIT (8253) as a reference. After calibration it programs the LAPIC timer in periodic mode via `LAPIC_TIMER_LVT`, `LAPIC_TIMER_DIV`, and `LAPIC_TIMER_INITCNT`.
+
+Key LAPIC register offsets (all accessed through `lapic_read`/`lapic_write`):
+
+| Constant             | Offset  | Purpose                              |
+|----------------------|---------|--------------------------------------|
+| `LAPIC_EOI`          | `0x0B0` | End-of-interrupt signal              |
+| `LAPIC_SVR`          | `0x0F0` | Spurious vector + enable             |
+| `LAPIC_TIMER_LVT`    | `0x320` | Timer local vector table entry       |
+| `LAPIC_TIMER_INITCNT`| `0x380` | Initial count register               |
+| `LAPIC_TIMER_CURCNT` | `0x390` | Current count (read-only)            |
+| `LAPIC_TIMER_DIV`    | `0x3E0` | Timer divider configuration          |
+
+### Scheduler integration
+
+On every timer interrupt the handler:
+
+1. Increments the global `ticks` counter (`volatile uint64_t ticks` from `timer.h`).
+2. Calls `mlfq_on_tick()`, which may demote the current process or trigger a priority boost and context switch.
+3. Calls `lapic_eoi()` to acknowledge the interrupt and allow further LAPIC interrupts.
+
+```c
+void lapic_eoi(void); // writes 0 to LAPIC_EOI register
+```
+
+The timer is the only source of preemptive scheduling — without it, only cooperative yields (syscall returns, blocking waits) would trigger context switches.
+
+## TTY / framebuffer renderer
+
+### `FrameBuffer` struct
+
+```c
+typedef struct FrameBuffer {
+    void        *base_address;       // linear framebuffer base (BGRA32)
+    size_t       buffer_size;        // total size in bytes
+    unsigned int width;              // horizontal resolution in pixels
+    unsigned int height;             // vertical resolution in pixels
+    unsigned int pixels_per_scan_line; // stride (may differ from width)
+} FrameBuffer;
+```
+
+Limine fills this struct during boot; `main.c` passes it to `init_renderer()`.
+
+### Renderer and global state
+
+```c
+typedef struct {
+    FrameBuffer      *framebuffer;
+    struct Point      cursor_position; // {x, y} in pixel coordinates
+    unsigned int      color;           // current foreground colour (BGRA32)
+    struct PSF1_FONT *psf1_font;       // loaded glyph data
+    bool              overwrite;       // overwrite instead of blend
+} Renderer;
+
+extern Renderer *global_renderer;
+
+void init_renderer(Renderer *render, FrameBuffer *buffer,
+                   struct PSF1_FONT *psf1_font);
+```
+
+`init_renderer()` stores the framebuffer and font pointers, resets the cursor to `{0, 0}`, and sets the default foreground to `BWHITE` from the Gruvbox Dark palette baked into `tty.h`.
+
+### PSF1 font loading
+
+```c
+bool load_psf1(const char *name, struct PSF1_FONT *font,
+               struct limine_module_response *modules);
+```
+
+`load_psf1()` searches the Limine module list for the file named by `name` (aeryk uses `cp850-8x16.psf`). On success it populates a `PSF1_FONT` struct:
+
+```c
+struct PSF1_HEADER {
+    unsigned char magic[2]; // { 0x36, 0x04 }
+    unsigned char mode;     // font mode flags
+    unsigned char charsize; // bytes per glyph (16 for 8×16)
+};
+
+struct PSF1_FONT {
+    struct PSF1_HEADER *psf1_header;
+    void               *glyph_buffer; // raw bitmap data
+};
+```
+
+Each glyph is 8 pixels wide and 16 pixels tall. `put_char()` blits one glyph to the framebuffer at a given pixel offset.
+
+### Console output
+
+```c
+void print(const char *str);
+```
+
+The kernel's primary console output function. `print()` iterates over `str` one character at a time, calling `put_char()` for printable characters, advancing `cursor_position.x` by 8 pixels per character, and wrapping to the next line when the right edge is reached. A `'\n'` advances `cursor_position.y` by 16 pixels (one glyph row) and resets `x` to 0.
+
+When the cursor reaches the bottom of the framebuffer, the renderer scrolls the entire display up by one character row by `memmove`-ing the framebuffer contents upward by `pixels_per_scan_line × 16 × sizeof(uint32_t)` bytes and clearing the newly exposed bottom row.
+
+The Gruvbox Dark colour palette is defined as 32-bit BGRA constants directly in `tty.h` and includes semantic aliases used throughout the kernel:
+
+```c
+#define FG  BWHITE   // 0xffebdbb2  default foreground
+#define BG  BLACK    // 0xff282828  background fill
+```

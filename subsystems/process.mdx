@@ -1,0 +1,203 @@
+---
+title: "Process model: creation, fork, exec, and file descriptors"
+sidebarTitle: "Process Model"
+description: "aeryk's process_t structure, ELF64 loader, copy-on-write fork, execve image replacement, per-process file descriptor table, and kernel-to-usermode transition."
+---
+
+Every schedulable unit in aeryk is represented by a `process_t` struct defined in `process.h`. The same type covers kernel threads (which never leave ring 0) and full user processes (which run ring-3 ELF64 binaries). User processes get their own page table, a user-mode stack, and an open file descriptor table; kernel threads share the kernel page table and have nothing but a stack and a function pointer. Both kinds are tracked in the same global process ring and scheduled by the same MLFQ.
+
+## The `process_t` struct
+
+```c
+typedef struct process {
+    uint64_t         pid;            // unique process ID
+    uint64_t         rsp;            // saved kernel stack pointer (context switch)
+    uint64_t         cr3;            // physical address of PML4 (page table root)
+    process_state_t  state;          // READY / RUNNING / BLOCKED / DEAD
+
+    void            *kernel_stack;   // kernel stack base (ring 0)
+
+    /* MLFQ scheduling fields */
+    uint8_t          priority;       // current queue index (0 = highest)
+    uint32_t         ticks_executed; // ticks consumed in this quantum
+    struct process  *queue_next;     // linkage within MLFQ queue
+    struct process  *queue_prev;
+
+    /* Global process ring */
+    struct process  *next;           // circular ring of all live + zombie procs
+    struct process  *prev;
+
+    /* Kernel thread entry point */
+    void           (*entrypoint)();  // function run by kernel threads
+
+    /* User process fields */
+    uint64_t         entry;          // ELF entry point (ring 3 RIP)
+    uint64_t         user_stack_top; // initial user RSP
+
+    file_descriptor_t fd_table[MAX_FDS]; // per-process open files
+
+    trapframe_t      fork_frame;     // register snapshot for fork_trampoline()
+
+    /* Parent/child and exit status */
+    struct process  *parent;
+    int              exit_code;
+} process_t;
+```
+
+Key globals that reference `process_t`:
+
+```c
+extern process_t *current_process; // process currently on the CPU
+extern process_t *process_queue;   // head of the global process ring
+extern process_t *idle_process;    // always-ready HLT loop
+```
+
+## `trapframe_t` — the fork register snapshot
+
+When a user process calls `fork()`, the kernel captures the full user-mode register state into a `trapframe_t` stored in the child's `fork_frame` field. `resume_usermode.asm` reads directly from this struct by fixed offsets, so field order is load-bearing and must not change:
+
+```c
+typedef struct {
+    uint64_t rdi, rsi, rdx, r10, r8,  r9;   // offsets  0 – 40
+    uint64_t rbx, rbp, r12, r13, r14, r15;  // offsets 48 – 88
+    uint64_t rax;                            // offset  96
+    uint64_t rip, rflags, rsp;              // offsets 104 – 120
+} trapframe_t;
+```
+
+## File descriptors
+
+Each process owns a fixed-size table of `file_descriptor_t` entries:
+
+```c
+#define MAX_FDS 32
+
+typedef struct file_descriptor {
+    vfs_node_t *node;   // VFS node this fd refers to (NULL = unused slot)
+    uint32_t    offset; // current read/write position within the file
+    int         flags;  // open flags (O_RDONLY, O_WRONLY, …)
+} file_descriptor_t;
+```
+
+`fd_table[0]` is conventionally stdin — `sys_read(fd=0, …)` delegates to `keyboard_read()`. Slots are allocated linearly; `fork_process()` copies the entire table into the child so open files are inherited.
+
+<Note>
+aeryk does not yet implement reference counting on VFS nodes, so closing a duplicated file descriptor in the child does not affect the parent's offset or vice versa — each `file_descriptor_t` entry is an independent copy.
+</Note>
+
+## Process creation
+
+### User processes — `create_user_process`
+
+```c
+process_t *create_user_process(const char *path, int argc, char *const argv[]);
+```
+
+Loads an ELF64 binary from the VFS and queues it to run in ring 3. The steps are:
+
+1. **Locate the file** — `vfs_find_node(vfs_root, path)` returns a `vfs_node_t *`; the call fails if the node is missing or is a directory.
+2. **Allocate a fresh page table** — `vmm_new_user_pagetable()` creates a new PML4 that maps only the kernel half; user segments are added next.
+3. **Load ELF segments** — `elf_load(file, pml4, &entry)` maps every `PT_LOAD` segment (see [ELF loader](#elf-loader) below).
+4. **Allocate the user stack** — one physical page is mapped at `USER_STACK_TOP - PAGE_SIZE` (`0x0000_6FFF_FFFF_F000`) with `PTE_USER | PTE_WRITABLE | PTE_NX`.
+5. **Push `argv[]`** — `setup_user_stack_args()` writes all argument strings and a NULL-terminated pointer array onto the stack page, then places an `[argc, argv_ptr]` pair at the resulting RSP. `crt0.asm` consumes this layout directly.
+6. **Wire up the `process_t`** — `pid`, `state`, `entry`, `user_stack_top`, `cr3`, and `parent` are set; the kernel stack is initialised via `setup_kernel_stack()` with `user_thread_stub` as the first return address.
+7. **Enqueue** — `enqueue_process()` adds the process to the global ring; `mlfq_enqueue()` puts it in queue 0.
+
+### Kernel threads — `create_kernel_thread`
+
+```c
+process_t *create_kernel_thread(void (*entry_point)());
+```
+
+A simpler path: no user page table, no ELF loading, no user stack. The thread gets a kernel stack primed with `kernel_thread_stub` as its first return address. `kernel_thread_stub` calls `sti`, invokes `entrypoint()`, and then calls `kernel_thread_exit()` which marks the thread `PROCESS_DEAD` and calls `schedule()`. Kernel threads share the kernel PML4 and therefore see all kernel memory.
+
+## ELF loader — `elf_load`
+
+```c
+int elf_load(vfs_node_t *file, uint64_t *pml4, uint64_t *out_entry);
+```
+
+Defined in `elf.c`. Validates the ELF64 header (magic, class, data encoding, and `ET_EXEC` type), then iterates the program header table. For each `PT_LOAD` segment:
+
+- PTE flags are derived from the segment's `p_flags`: `PF_W` → `PTE_WRITABLE`; absence of `PF_X` → `PTE_NX`; `PTE_USER` and `PTE_PRESENT` are always set.
+- The virtual address range `[p_vaddr, p_vaddr + p_memsz)` is page-aligned and each page is allocated with `pmm_alloc_page()`, zeroed, then populated with file bytes from the range `[p_vaddr, p_vaddr + p_filesz)`.
+- Each page is mapped into `pml4` with `vmm_map_page()`.
+
+On success `*out_entry` is set to `ehdr->e_entry` and the function returns 0. Any failure (bad header, allocation error) returns -1.
+
+<Warning>
+`elf_load` only handles `ET_EXEC` (statically linked executables). Position-independent executables (`ET_DYN`) and shared objects are not supported.
+</Warning>
+
+## Fork — `fork_process`
+
+```c
+process_t *fork_process(process_t *parent, const trapframe_t *regs);
+```
+
+Implements POSIX-style fork. Steps:
+
+1. **Clone the address space** — `vmm_clone_user_pagetable()` performs a copy-on-write clone of the parent's PML4.
+2. **Allocate child `process_t`** — a fresh struct is zeroed and given a new `pid`.
+3. **Copy file descriptor table** — `memcpy(child->fd_table, parent->fd_table, sizeof(child->fd_table))`.
+4. **Save the fork frame** — `child->fork_frame = *regs` copies the parent's syscall register snapshot; then `child->fork_frame.rax = 0` so the child returns 0 from `fork()`.
+5. **Prime the kernel stack** — `setup_kernel_stack(child->kernel_stack, fork_trampoline)` primes the child's kernel stack so the first `schedule()` switch into it lands at `fork_trampoline`.
+6. **Enqueue** — added to the global ring and enqueued in MLFQ queue 0.
+
+`fork_trampoline` is a small C stub that enables interrupts and then calls `resume_usermode(&current_process->fork_frame)`. `resume_usermode` (in `resume_usermode.asm`) pushes a full `iretq` frame built from the `trapframe_t` and jumps into ring 3 at the instruction that followed the `syscall` in the parent.
+
+## Exec — `exec_process`
+
+```c
+int exec_process(process_t *proc, const char *path, int argc, char *const argv[]);
+```
+
+Replaces `proc`'s entire user image with a new ELF binary. Must only be called on `current_process`. Steps:
+
+1. **Load new image** — `load_elf_into_new_pagetable()` allocates a fresh PML4, runs `elf_load()`, and sets up the user stack with the new `argv[]`.
+2. **Destroy old image** — `vmm_destroy_user_pagetable(old_pml4)` frees all user mappings.
+3. **Switch address space** — `proc->cr3` is updated and `mov %cr3` activates the new page table immediately.
+4. **Jump into ring 3** — `enter_usermode(proc->entry, proc->user_stack_top)` never returns.
+
+On failure (missing file, bad ELF, allocation error) the function returns `-1` and the process continues running its old image unchanged.
+
+## Usermode entry — `enter_usermode`
+
+```c
+void enter_usermode(uint64_t entry_point, uint64_t user_stack);
+```
+
+Transitions from ring 0 to ring 3 using `iretq`. It manually constructs the five-word `iretq` stack frame:
+
+```c
+void enter_usermode(uint64_t entry_point, uint64_t user_stack)
+{
+    asm volatile(
+        "cli        \n"
+        "push $0x1B \n"  // SS  — user data selector (GDT index 3, RPL 3)
+        "push %0    \n"  // RSP — initial user stack pointer
+        "push $0x202\n"  // RFLAGS — IF=1, reserved bit 1 set
+        "push $0x23 \n"  // CS  — user code selector (GDT index 4, RPL 3)
+        "push %1    \n"  // RIP — ELF entry point
+        "iretq"
+        : : "r"(user_stack), "r"(entry_point) : "memory"
+    );
+}
+```
+
+The `0x202` RFLAGS value sets the interrupt-enable flag (IF) so that the new process runs with interrupts enabled from its very first instruction.
+
+## Wait and child reaping
+
+```c
+int wait_reap_child(process_t *parent, int64_t pid, int *status_out);
+```
+
+Walks the global `process_queue` ring looking for a child of `parent`:
+
+- If `pid <= 0`, any dead child matches; otherwise only the child with that exact pid.
+- On a match: copies `child->exit_code` to `*status_out` (if non-NULL), unlinks the child from the ring, frees its kernel stack and user page table, `kfree`s the struct, and returns the child's pid.
+- Returns `0` if `parent` has living children but none are dead yet — the caller should block and retry.
+- Returns `-1` (`ECHILD`) if `parent` has no children at all.
+
+`MAX_USER_ARGS` caps the number of command-line arguments at 8 for both `create_user_process()` and `exec_process()`.

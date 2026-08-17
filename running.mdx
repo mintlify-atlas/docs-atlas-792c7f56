@@ -1,0 +1,164 @@
+---
+title: "Run aeryk in QEMU with UEFI or BIOS firmware"
+sidebarTitle: "Running"
+description: "Boot the aeryk kernel ISO in QEMU using UEFI (EDK2/OVMF) or legacy BIOS mode, with 2 GB RAM and serial output on stdio."
+---
+
+Once you have built `template-x86_64.iso` (see [Building](/building)), you can boot aeryk in QEMU with a single `make` target. The `GNUmakefile` supports four run modes — UEFI or BIOS, ISO or HDD image — and a dedicated debug target for GDB sessions. All modes use the same default QEMU flags.
+
+## Default QEMU flags
+
+Every `run` target passes the following flags to `qemu-system-x86_64`:
+
+```
+-m 2G -d guest_errors,int -D qemu.log -serial stdio
+```
+
+| Flag                      | Effect                                                       |
+| ------------------------- | ------------------------------------------------------------ |
+| `-m 2G`                   | Allocates 2 GB of RAM to the VM                              |
+| `-d guest_errors,int`     | Logs guest errors and every interrupt to `qemu.log`          |
+| `-D qemu.log`             | Writes the QEMU debug log to `qemu.log` in the working directory |
+| `-serial stdio`           | Forwards the VM's COM1 serial port to your terminal's stdin/stdout |
+
+<Note>
+  `qemu.log` is written to your working directory on every run and captures all guest-triggered interrupts and errors. It is invaluable when diagnosing triple faults, unexpected exceptions, or crashes — `tail -f qemu.log` in a second terminal gives you a live interrupt trace while the kernel runs.
+</Note>
+
+## Running the ISO
+
+<Tabs>
+  <Tab title="UEFI (recommended)">
+    The UEFI target uses EDK2/OVMF for the firmware. The `edk2-ovmf` rule downloads
+    the latest nightly OVMF release automatically the first time you run it.
+
+    <Tabs>
+      <Tab title="Linux">
+        ```sh
+        make run
+        ```
+      </Tab>
+      <Tab title="macOS">
+        ```sh
+        make TOOLCHAIN_PREFIX=x86_64-elf- run
+        ```
+      </Tab>
+    </Tabs>
+
+    This boots `template-x86_64.iso` on a `q35` machine with the OVMF firmware
+    image at `edk2-ovmf/ovmf-code-x86_64.fd`.
+  </Tab>
+  <Tab title="BIOS (legacy)">
+    The BIOS target skips OVMF and boots the ISO using the legacy Limine BIOS
+    stage 1 embedded in the image.
+
+    <Tabs>
+      <Tab title="Linux">
+        ```sh
+        make run-bios
+        ```
+      </Tab>
+      <Tab title="macOS">
+        ```sh
+        make TOOLCHAIN_PREFIX=x86_64-elf- run-bios
+        ```
+      </Tab>
+    </Tabs>
+  </Tab>
+</Tabs>
+
+## Running the HDD image
+
+If you built the raw HDD image with `make all-hdd`, use the corresponding run targets:
+
+<Tabs>
+  <Tab title="UEFI">
+    ```sh
+    make run-hdd                              # Linux
+    make TOOLCHAIN_PREFIX=x86_64-elf- run-hdd # macOS
+    ```
+  </Tab>
+  <Tab title="BIOS">
+    ```sh
+    make run-hdd-bios                              # Linux
+    make TOOLCHAIN_PREFIX=x86_64-elf- run-hdd-bios # macOS
+    ```
+  </Tab>
+</Tabs>
+
+## Boot sequence
+
+After QEMU starts you will see the Limine menu (5-second timeout, then auto-boot into **Aeryk**). The kernel then initialises each subsystem in order and prints a status line for each:
+
+```
+[-] Display initialized.
+[-] Serial initialized.
+[0] PMM Initialized
+[1] VMM Initialized.
+[4] Slab Allocator kmalloc online.
+[-] Slab Allocator initialized.
+[5] Scheduler initialized.
+[5] Parsing initramfs...
+[6] IRQ1 keyboard listening...
+[7] Syscalls initialized...
+[8] /bin/exectest loaded, switching to Ring 3...
+[8] /bin/sh loaded, switching to Ring 3...
+>
+```
+
+What each line means:
+
+| Message | Subsystem initialised |
+| ------- | --------------------- |
+| `Display initialized.` | Framebuffer TTY and PSF1 font renderer are online |
+| `Serial initialized.` | COM1 serial port ready (output mirrored to your terminal via `-serial stdio`) |
+| `PMM Initialized` | Physical memory manager has parsed the Limine memory map |
+| `VMM Initialized.` | Virtual memory / paging active; higher-half kernel mapping in place |
+| `Slab Allocator kmalloc online.` | APIC timer calibrated and firing; `kmalloc`/`kfree` available |
+| `Slab Allocator initialized.` | Slab caches set up |
+| `Scheduler initialized.` | MLFQ scheduler ready to accept processes |
+| `Parsing initramfs...` | CPIO archive parsed and VFS populated under `/` |
+| `IRQ1 keyboard listening...` | PS/2 keyboard IRQ1 handler registered; `sys_read(0, …)` will block on keystrokes |
+| `Syscalls initialized...` | `SYSCALL`/`SYSRET` MSRs configured; Ring 3 programs can call the kernel |
+| `/bin/exectest loaded, switching to Ring 3...` | First userland ELF mapped and enqueued in the scheduler |
+| `/bin/sh loaded, switching to Ring 3...` | Shell process enqueued; MLFQ scheduler enters its main loop |
+| `> ` | Shell prompt — the kernel is now running entirely in Ring 3 |
+
+## Using the shell
+
+The shell (`/bin/sh`) accepts the name of any binary present in `/bin/`. Useful commands:
+
+```
+> ls
+> cat hello.txt
+> exit
+```
+
+Any program in `/bin/` can be invoked by its bare name. The initramfs also contains a `hello.txt` file at the root level (created during the build) that you can read with `cat`.
+
+<Note>
+  Pipes and I/O redirection are not yet implemented. Each command runs as a new process via `sys_spawn`; the shell waits for it to exit before showing the next prompt.
+</Note>
+
+## GDB debug session
+
+The `debug` target starts QEMU with `-s -S`, which opens a GDB server on `localhost:1234` and pauses execution immediately so you can attach before the first instruction runs:
+
+```sh
+make debug                              # Linux
+make TOOLCHAIN_PREFIX=x86_64-elf- debug # macOS
+```
+
+In a second terminal, attach GDB (use `x86_64-elf-gdb` on macOS or `gdb` on Linux) and load the kernel's debug symbols:
+
+```sh
+x86_64-elf-gdb kernel/bin-x86_64/kernel
+(gdb) target remote :1234
+(gdb) continue
+```
+
+Set breakpoints before `continue` to halt at any kernel function. The serial output remains connected to your first terminal through `-serial stdio`, so `print()` calls are visible even under the debugger.
+
+<Warning>
+  The `debug` target also uses the UEFI firmware path and will download `edk2-ovmf` if it is not already present, just like `make run`.
+</Warning>

@@ -1,0 +1,459 @@
+---
+title: "aeryk userland libc: stdio, stdlib, string, and unistd"
+sidebarTitle: "libc"
+description: "Reference for aeryk's minimal libc: syscall wrappers in unistd, printf/puts/putchar in stdio, exit in stdlib, and strlen/strcmp/memcpy in string."
+---
+
+aeryk ships a purpose-built libc under `libc/` that is compiled into `obj-userland/libc.a` and linked into every userland binary. It is intentionally minimal: only the functions actually needed by the current set of programs are implemented. The library is organized into four modules — `stdio`, `stdlib`, `string`, and `unistd` — each with its own source directory and a corresponding header in `libc/include/`. This page documents every implemented function, its calling convention, and key behavioral notes.
+
+<Warning>
+Several functions that a POSIX libc would provide are **not yet implemented** in aeryk's libc. Attempting to use `malloc`, `free`, `sprintf`, `snprintf`, `atoi`, `strchr`, `strtok`, `strncmp`, `strcpy`, `strncpy`, or `strcat` will result in a linker error. The `ctype.h` functions (`isspace`, `isdigit`, `isalpha`) and `errno` are also absent. These are planned but not yet available.
+</Warning>
+
+---
+
+## `stdio.h` — Formatted and character output
+
+All three stdio functions write to **file descriptor 1** (the TTY / standard output). There is no `FILE *` stream abstraction — output goes directly through the `SYS_write` syscall via `write()`.
+
+### `printf`
+
+```c
+int printf(const char *restrict format, ...);
+```
+
+Writes a formatted string to fd 1. Returns the number of characters written, or `-1` on error.
+
+**Supported format specifiers:**
+
+| Specifier | Meaning |
+|---|---|
+| `%c` | Single `char` argument |
+| `%s` | NUL-terminated `const char *` argument |
+| `%d` | Signed `int` (handles negative values with a leading `-`) |
+| `%u` | Unsigned `int` |
+| `%x` | Unsigned `int` in lowercase hexadecimal |
+| `%p` | Pointer — printed as `0x<hex address>` |
+| `%%` | Literal `%` character |
+
+The implementation renders integers into a stack-allocated temporary buffer using an internal `utoa()` helper, then flushes the buffer through `putchar()` one byte at a time. There is no output buffering — each character causes a separate `write(1, &c, 1)` syscall.
+
+<Note>
+Width/precision modifiers (e.g., `%5d`, `%.3s`, `%08x`) and length modifiers (`%ld`, `%zu`) are **not** supported. Unknown specifiers fall through to printing the remainder of the format string verbatim.
+</Note>
+
+---
+
+### `putchar`
+
+```c
+int putchar(int c);
+```
+
+Writes the single character `c` (cast to `unsigned char`) to fd 1 via `write(1, &c, 1)`. Returns the character written as an `int`, or `EOF` (`-1`) if the write fails.
+
+**Source (`libc/stdio/putchar.c`):**
+
+```c
+int putchar(int ic) {
+    unsigned char c = (unsigned char)ic;
+    if (write(1, &c, 1) == 1) {
+        return (int)c;
+    }
+    return EOF;
+}
+```
+
+---
+
+### `puts`
+
+```c
+int puts(const char *restrict s);
+```
+
+Writes the string `s` followed by a newline (`\n`) to fd 1. Uses `strlen()` to measure the string, then calls `write()` for the string body and `putchar('\n')` for the terminator. Returns `0` on success, `EOF` on write failure.
+
+**Source (`libc/stdio/puts.c`):**
+
+```c
+int puts(const char *restrict s) {
+    size_t len = strlen(s);
+    if (write(1, s, len) != (ssize_t)len) {
+        return EOF;
+    }
+    if (putchar('\n') == EOF) {
+        return EOF;
+    }
+    return 0;
+}
+```
+
+---
+
+## `unistd.h` — Syscall wrappers
+
+Every function in `libc/unistd.c` is a thin inline-assembly wrapper around the x86_64 `syscall` instruction. The System V AMD64 ABI calling convention is used: syscall number in `rax`, arguments in `rdi`, `rsi`, `rdx` (in that order), and the return value back in `rax`. The `rcx` and `r11` registers are clobbered by `syscall` and declared as such in every constraint list.
+
+The syscall numbers come from `abi/include/abi/syscall.h`:
+
+```c
+#define SYS_read    0
+#define SYS_write   1
+#define SYS_open    2
+#define SYS_close   3
+#define SYS_fork    57
+#define SYS_execve  59
+#define SYS_exit    60
+#define SYS_wait    61
+#define SYS_readdir 78
+```
+
+---
+
+### `open`
+
+```c
+int open(const char *path);
+```
+
+Opens the file at `path` in the kernel's VFS. Returns a non-negative file descriptor on success, or `-1` on error (e.g., file not found).
+
+<Note>
+aeryk's `open` takes only a path — there are no `flags` or `mode` arguments yet. Every open is effectively a read-only open for regular files.
+</Note>
+
+**Inline assembly:**
+
+```c
+int open(const char *path) {
+    long ret;
+    asm volatile("syscall"
+                  : "=a"(ret)
+                  : "0"(SYS_open), "D"(path)
+                  : "rcx", "r11", "memory");
+    return (int)ret;
+}
+```
+
+---
+
+### `read`
+
+```c
+ssize_t read(int fd, void *buf, size_t count);
+```
+
+Reads up to `count` bytes from `fd` into `buf`. Returns the number of bytes actually read, `0` on EOF, or `-1` on error. For fd 0 (stdin / keyboard), the driver blocks until input is available and returns after one full line is ready.
+
+**Inline assembly:**
+
+```c
+ssize_t read(int fd, void *buf, size_t count) {
+    long ret;
+    asm volatile("syscall"
+                  : "=a"(ret)
+                  : "0"(SYS_read), "D"(fd), "S"(buf), "d"(count)
+                  : "rcx", "r11", "memory");
+    return ret;
+}
+```
+
+---
+
+### `write`
+
+```c
+ssize_t write(int fd, const void *buf, size_t count);
+```
+
+Writes `count` bytes from `buf` to `fd`. Returns the number of bytes written, or `-1` on error. fd 1 is the TTY (stdout), fd 2 is stderr (mapped to the same TTY in aeryk).
+
+**Inline assembly:**
+
+```c
+ssize_t write(int fd, const void *buf, size_t count) {
+    long ret;
+    asm volatile("syscall"
+                  : "=a"(ret)
+                  : "0"(SYS_write), "D"(fd), "S"(buf), "d"(count)
+                  : "rcx", "r11", "memory");
+    return ret;
+}
+```
+
+---
+
+### `close`
+
+```c
+int close(int fd);
+```
+
+Closes the file descriptor `fd`, releasing the kernel's reference to the underlying file. Returns `0` on success, `-1` on error.
+
+**Inline assembly:**
+
+```c
+int close(int fd) {
+    long ret;
+    asm volatile("syscall"
+                  : "=a"(ret)
+                  : "0"(SYS_close), "D"(fd)
+                  : "rcx", "r11", "memory");
+    return (int)ret;
+}
+```
+
+---
+
+### `fork`
+
+```c
+int fork(void);
+```
+
+Creates a near-identical copy of the calling process. The child gets its own address space (copy-on-write pages), the same open file descriptors, and the same register state — but resumes execution immediately after the `syscall` instruction. Returns `0` in the child, the child's PID in the parent, or `-1` on error.
+
+**Inline assembly:**
+
+```c
+int fork(void) {
+    long ret;
+    asm volatile("syscall"
+                  : "=a"(ret)
+                  : "0"(SYS_fork)
+                  : "rcx", "r11", "memory");
+    return (int)ret;
+}
+```
+
+---
+
+### `execve`
+
+```c
+int execve(const char *path, char *const argv[]);
+```
+
+Replaces the calling process's ELF image with the executable at `path`, keeping the same PID, parent, and open file descriptors. `argv` is a NULL-terminated array of argument strings; by convention `argv[0]` is the program name. On success this function **never returns** — the process is now running the new program from `_start`. Returns `-1` only on failure (e.g., file not found or not a valid ELF).
+
+<Note>
+The POSIX `execve` signature includes an `envp` parameter for environment variables. aeryk omits it — there is no environment variable support yet.
+</Note>
+
+**Inline assembly:**
+
+```c
+int execve(const char *path, char *const argv[]) {
+    long ret;
+    asm volatile("syscall"
+                  : "=a"(ret)
+                  : "0"(SYS_execve), "D"(path), "S"(argv)
+                  : "rcx", "r11", "memory");
+    return (int)ret;
+}
+```
+
+---
+
+### `wait`
+
+```c
+int wait(int pid, int *status);
+```
+
+Blocks the calling process until the child with the given `pid` terminates. The child's exit status code is written through `status`. Returns the PID of the reaped child on success, or `-1` on error.
+
+<Note>
+Standard POSIX `wait()` and `waitpid()` use different signatures. aeryk's `wait` always takes an explicit `pid` — there is no "wait for any child" mode yet.
+</Note>
+
+**Inline assembly:**
+
+```c
+int wait(int pid, int *status) {
+    long ret;
+    asm volatile("syscall"
+                  : "=a"(ret)
+                  : "0"(SYS_wait), "D"(pid), "S"(status)
+                  : "rcx", "r11", "memory");
+    return (int)ret;
+}
+```
+
+---
+
+### `listdir`
+
+```c
+ssize_t listdir(const char *path, char *buf, size_t size);
+```
+
+Lists the entries of the directory at `path` into `buf`. Each entry is written as its name followed by `\n`; subdirectory names are suffixed with `/`. Returns the total number of bytes written into `buf`, or `-1` if `path` is not a directory or does not exist.
+
+**Inline assembly:**
+
+```c
+ssize_t listdir(const char *path, char *buf, size_t size) {
+    long ret;
+    asm volatile("syscall"
+                  : "=a"(ret)
+                  : "0"(SYS_readdir), "D"(path), "S"(buf), "d"(size)
+                  : "rcx", "r11", "memory");
+    return ret;
+}
+```
+
+---
+
+## `stdlib.h` — Process control
+
+### `exit`
+
+```c
+void exit(int status);
+```
+
+Terminates the calling process immediately with exit code `status`. Invokes `SYS_exit` (60) directly via inline assembly and marks itself `__builtin_unreachable()` so the compiler knows it never returns.
+
+**Source (`libc/stdlib/exit.c`):**
+
+```c
+void exit(int status) {
+    asm volatile("syscall"
+                 :
+                 : "a"((uint64_t)SYS_exit), "D"((uint64_t)status)
+                 : "rcx", "r11", "memory");
+    __builtin_unreachable();
+}
+```
+
+The `crt0.asm` entry point calls `exit()` with `main`'s return value, so a plain `return 0;` from `main` is always safe and does not fall off into undefined memory.
+
+---
+
+## `string.h` — Memory and string utilities
+
+### `strlen`
+
+```c
+size_t strlen(const char *str);
+```
+
+Returns the number of characters in the NUL-terminated string `str`, not including the NUL terminator. Walks the string byte-by-byte until a `\0` is found.
+
+**Source (`libc/string/strlen.c`):**
+
+```c
+size_t strlen(const char *str) {
+    size_t len = 0;
+    while (str[len]) {
+        len++;
+    }
+    return len;
+}
+```
+
+---
+
+### `strcmp`
+
+```c
+int strcmp(const char *s1, const char *s2);
+```
+
+Compares two NUL-terminated strings lexicographically using unsigned byte values. Returns `0` if the strings are equal, a negative value if `s1` sorts before `s2`, or a positive value if `s1` sorts after `s2`.
+
+**Source (`libc/string/strcmp.c`):**
+
+```c
+int strcmp(const char *s1, const char *s2) {
+    while (*s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+    }
+    return (unsigned char)*s1 - (unsigned char)*s2;
+}
+```
+
+---
+
+### `memcpy`
+
+```c
+void *memcpy(void *restrict dest, const void *restrict src, size_t n);
+```
+
+Copies exactly `n` bytes from `src` to `dest`. The `restrict` qualifier signals that the two regions must not overlap — use `memmove` when overlap is possible. Returns `dest`.
+
+**Source (`libc/string/string.c`):**
+
+```c
+void *memcpy(void *restrict dest, const void *restrict src, size_t len) {
+    uint8_t *restrict pdest = (uint8_t *restrict)dest;
+    const uint8_t *restrict psrc = (uint8_t *restrict)src;
+    for (size_t i = 0; i < len; i++) {
+        pdest[i] = psrc[i];
+    }
+    return dest;
+}
+```
+
+---
+
+### `memset`
+
+```c
+void *memset(void *s, int c, size_t n);
+```
+
+Fills the first `n` bytes of the memory block at `s` with the byte value `(unsigned char)c`. Returns `s`.
+
+**Source (`libc/string/string.c`):**
+
+```c
+void *memset(void *s, int c, size_t n) {
+    uint8_t *p = (uint8_t *)s;
+    for (size_t i = 0; i < n; i++) {
+        p[i] = (uint8_t)c;
+    }
+    return s;
+}
+```
+
+---
+
+### `memmove`
+
+```c
+void *memmove(void *dest, const void *src, size_t n);
+```
+
+Copies `n` bytes from `src` to `dest`, correctly handling the case where the two regions overlap. When `src > dest`, copies forward; when `src < dest`, copies backward. Returns `dest`.
+
+---
+
+### `memcmp`
+
+```c
+int memcmp(const void *s1, const void *s2, size_t n);
+```
+
+Compares the first `n` bytes of `s1` and `s2` as unsigned bytes. Returns `0` if identical, `-1` if the first differing byte in `s1` is less than the corresponding byte in `s2`, or `+1` if greater.
+
+---
+
+## What is not yet implemented
+
+<Warning>
+The following standard C library features are **planned but not yet implemented** in aeryk's libc. Using them will produce a linker error (`undefined reference`):
+
+**string.h:** `strchr`, `strtok`, `strncmp`, `strcpy`, `strncpy`, `strcat`, `strncat`
+
+**stdlib.h:** `malloc`, `free`, `realloc`, `calloc`, `atoi`, `atol`, `strtol`, `sprintf`, `snprintf`
+
+**ctype.h:** `isspace`, `isdigit`, `isalpha`, `isupper`, `islower`, `toupper`, `tolower` — the entire header is absent
+
+**errno:** No `errno` global or `<errno.h>` header; error conditions are communicated exclusively through negative return values
+</Warning>

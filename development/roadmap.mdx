@@ -1,0 +1,119 @@
+---
+title: "aeryk development roadmap and planned features"
+sidebarTitle: "Roadmap"
+description: "Planned features for aeryk: pipes/IPC, SMP, userland heap (brk/mmap), mouse driver, compositor, copy_from_user safety, and expanded libc."
+---
+
+aeryk is a hobby x86_64 kernel built incrementally as a learning project. The kernel reached a working userland in mid-2026 — processes can spawn, fork, exec ELF binaries, and interact with a line-buffered keyboard-backed shell — and development is now focused on the primitives needed to support inter-process communication, a richer libc, and eventually a simple compositor. The sections below track what is finished, what is actively in progress, and what is planned for later milestones.
+
+## Completed features
+
+The following subsystems are implemented and exercised by the unit-test suite and/or real userland programs:
+
+- [x] Boot via [Limine](https://codeberg.org/Limine/Limine) bootloader
+- [x] Framebuffer TTY
+- [x] Font rendering (PSF1)
+- [x] Global Descriptor Table (GDT)
+- [x] Interrupt Descriptor Table (IDT)
+- [x] Physical memory manager (PMM)
+- [x] Virtual memory / paging (VMM)
+- [x] APIC
+- [x] Keyboard driver
+- [x] Heap allocator (slab)
+- [x] MLFQ scheduler and process management
+- [x] Serial driver (COM1, used for debugging and GDB output)
+- [x] Syscall interface
+  - [x] `sys_write`, `sys_exit`
+  - [x] `sys_open`, `sys_read`, `sys_close`
+  - [x] `sys_spawn`, `sys_wait`
+  - [x] Context switching with MLFQ
+  - [x] `fork`, `execve`
+  - [x] Kill offending process (not halt kernel) on a CPL-3 fault (`isr_handler` in `idt.c`)
+- [x] Initramfs (CPIO)
+- [x] Virtual filesystem (VFS)
+- [x] ELF loader
+- [x] libc wrappers for syscalls
+- [x] Userland programs: `init`, `cat`, `sh`, `ls`, `forktest`, `exectest`, `crashtest`
+- [x] Keyboard wired to `sys_read` (fd 0, blocking, line-buffered)
+
+## In progress / near-term
+
+These items are partially designed or have open tracking notes in the README:
+
+### `copy_from_user` / `copy_to_user` with exception table
+
+Syscalls run at CPL 0, so a bad user pointer passed to (for example) `read(fd, (void*)0xdeadbeef, 100)` currently looks like a kernel bug rather than a user error — the CPL-3 fault check in `isr_handler` cannot distinguish the two. The fix is a pair of safe-copy helpers that tag the memory-touching instructions and check the faulting `rip` against a compile-time exception table, so the kernel can redirect a fault to an error path instead of dying. This is a prerequisite for any hardened syscall that accepts a user pointer.
+
+### Pipes / IPC between processes
+
+The shell can currently only run single commands. Supporting `|` requires a kernel pipe primitive: a ring buffer shared between two file descriptors, with blocking `read` when the buffer is empty and blocking `write` when it is full. This is the primary missing piece for a useful interactive shell.
+
+### `clone` syscall
+
+`fork` and `execve` are implemented; `clone` (for fine-grained thread/namespace sharing) is listed as a remaining syscall. It is needed for future threading support.
+
+### `dup`, `dup2`, and `pipe()` syscall wrappers
+
+The `unistd.c` libc layer needs `dup`, `dup2`, and `pipe()` wrappers once the kernel pipe implementation lands. These are the userland-visible interface to the IPC work above.
+
+### Remaining libc functions
+
+The libc shipped with aeryk is minimal. The following are explicitly called out in the README as needed:
+
+| Category | Missing functions |
+| -------- | ----------------- |
+| `string.h` | `strchr`, `strtok`, `strncmp`, `strcpy`, `strncpy`, `strcat` |
+| `ctype.h` | `isspace`, `isdigit`, `isalpha` |
+| `stdlib.h` | `malloc`, `free`, `calloc`, `atoi` |
+| `stdio.h` | `sprintf`, `snprintf` |
+| `unistd.h` | `dup`, `dup2`, `pipe` |
+| Error handling | `errno` (syscalls currently collapse all failures to `-1`) |
+
+`string.h` additions are needed for shell command parsing (tokenising around `|` and whitespace). `malloc`/`free` depend on a userland heap (`brk`/anonymous `mmap`) landing first. `sprintf`/`snprintf` are needed for the compositor protocol and error messages.
+
+## Future / compositor milestone
+
+The compositor milestone is a longer-horizon goal that requires several foundational pieces before any window can be drawn:
+
+### Userland memory
+
+- [ ] **Userland heap allocation** — `brk` / anonymous `mmap` so userland programs can call `malloc`/`free`
+- [ ] **Shared memory mapping** — `mmap MAP_SHARED` so two processes can share a buffer (needed for the compositor's window surfaces)
+- [ ] **Framebuffer mapped into userland** — expose the Limine framebuffer as a user-accessible mapping so the compositor process can write pixels directly
+
+### Framebuffer performance
+
+- [ ] **Word-sized `memcpy`** — the current byte-at-a-time copy is too slow for full-frame blits; switch to 8-byte stores
+- [ ] **Write-combining framebuffer mapping** — use PAT/MTRR to mark the framebuffer region as write-combining, which collapses multiple writes into single bus transactions and dramatically increases blit throughput
+
+### Input
+
+- [ ] **Mouse driver** — PS/2 mouse support; produces `(dx, dy, buttons)` events consumed by the compositor's hit-testing logic
+
+### Compositor core
+
+- [ ] **Compositor protocol over IPC** — a structured message protocol (over pipes or a shared ring buffer) carrying window events, damage rectangles, and input events
+- [ ] **Window/surface data structure** — position, z-order, and shared buffer descriptor for each client window
+- [ ] **Compositing loop** — blit all visible windows to the framebuffer each tick, triggered off the existing APIC timer
+- [ ] **Redraw / vsync trigger** — tie redraws to the timer interrupt rather than spinning
+
+### Compositor protocol (client side)
+
+- [ ] `create_window` — allocate a surface and return a shared buffer handle
+- [ ] `damage` — notify the compositor that a region of the surface has changed
+- [ ] `destroy_window` — release surface resources
+
+### Input routing
+
+- [ ] **Hit-testing** — determine which window is under the cursor on mouse events
+- [ ] **Focus management** — route keyboard events to the focused window
+- [ ] **Cursor rendering** — draw a software cursor sprite on top of the composited frame
+- [ ] **First real client** — a test window that draws into its shared buffer to validate the end-to-end path
+
+## SMP (Symmetric Multi-Processing)
+
+Running kernel threads and processes across multiple CPU cores is listed as a future goal. It requires per-CPU scheduler queues, spinlock-based synchronisation for shared kernel data structures, inter-processor interrupts (IPIs) for TLB shootdown and scheduling, and APIC initialisation for all APs (application processors). No timeline is set for this milestone.
+
+<Note>
+aeryk is a hobby project and the roadmap reflects personal learning goals rather than a product schedule. Items may be reordered, split, or dropped as the project evolves. For the latest status, see the [aeryk repository on GitHub](https://github.com/Riley1101/aeryk).
+</Note>

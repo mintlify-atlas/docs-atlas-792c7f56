@@ -1,0 +1,98 @@
+{
+  "projectType": "general",
+  "projectName": "aeryk",
+  "projectDescription": "A hobbyist x86_64 kernel written in C, booted via the Limine bootloader, featuring a physical and virtual memory manager, MLFQ scheduler, syscall interface, VFS, ELF loader, and a minimal userland libc with a shell.",
+  "theme": "aspen",
+  "primaryColor": "#ffea69",
+  "lightColor": null,
+  "darkColor": "#1a1a1a",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "building",
+              "running"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/boot",
+              "architecture/memory",
+              "architecture/interrupts"
+            ]
+          },
+          {
+            "group": "Kernel Subsystems",
+            "pages": [
+              "subsystems/scheduler",
+              "subsystems/process",
+              "subsystems/filesystem",
+              "subsystems/drivers"
+            ]
+          },
+          {
+            "group": "Syscall Interface",
+            "pages": [
+              "syscalls/overview",
+              "syscalls/reference"
+            ]
+          },
+          {
+            "group": "Userland & libc",
+            "pages": [
+              "userland/overview",
+              "userland/libc",
+              "userland/programs"
+            ]
+          },
+          {
+            "group": "Development",
+            "pages": [
+              "development/testing",
+              "development/debugging",
+              "development/roadmap"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Limine bootloader integration with framebuffer TTY and PSF1 font rendering",
+    "Physical Memory Manager (PMM) with per-page reference counting",
+    "Virtual Memory Manager (VMM) with 4-level paging and copy-on-write fork support",
+    "Global Descriptor Table (GDT) and Interrupt Descriptor Table (IDT)",
+    "APIC and I/O APIC interrupt controller support",
+    "Multi-Level Feedback Queue (MLFQ) process scheduler",
+    "Slab allocator (kmalloc/kfree) for kernel heap management",
+    "ELF64 loader for user-space executables",
+    "Initramfs (CPIO) filesystem with in-memory VFS",
+    "Syscall interface via SYSCALL/SYSRET MSR: read, write, open, close, fork, execve, exit, wait, readdir",
+    "Minimal userland libc (stdio, stdlib, string, unistd) with syscall wrappers",
+    "Userland shell (sh) with fork+execve process spawning",
+    "Keyboard driver wired to stdin (fd 0) with line-buffered blocking reads",
+    "Serial driver for GDB debugging",
+    "Unity-based unit tests for kernel subsystems"
+  ],
+  "publicApiSurface": [
+    "SYS_read (0)", "SYS_write (1)", "SYS_open (2)", "SYS_close (3)",
+    "SYS_fork (57)", "SYS_execve (59)", "SYS_exit (60)", "SYS_wait (61)", "SYS_readdir (78)",
+    "init_gdt()", "init_idt()", "init_pmm()", "init_vmm()", "init_slab()", "init_apic()",
+    "init_scheduler()", "init_syscalls()", "init_keyboard()", "init_serial()",
+    "pmm_alloc_page()", "pmm_free_page()", "pmm_page_ref_inc()", "pmm_page_refcount()",
+    "vmm_map_page()", "vmm_new_user_pagetable()", "vmm_destroy_user_pagetable()", "vmm_clone_user_pagetable()", "vmm_handle_cow_fault()",
+    "kmalloc()", "kfree()",
+    "create_user_process()", "create_kernel_thread()", "fork_process()", "exec_process()", "wait_reap_child()",
+    "mlfq_init()", "mlfq_enqueue()", "mlfq_pick_next()", "mlfq_on_tick()", "schedule()",
+    "init_vfs()", "vfs_create_node()", "vfs_add_child()", "vfs_find_node()",
+    "irq_install_handler()", "irq_uninstall_handler()",
+    "open()", "read()", "write()", "close()", "fork()", "execve()", "wait()", "listdir()", "exit()"
+  ]
+}

@@ -1,0 +1,172 @@
+---
+title: "Debug aeryk with GDB, serial output, and QEMU"
+sidebarTitle: "Debugging"
+description: "Use QEMU's -s -S flags and GDB to set breakpoints in aeryk's kernel, monitor interrupt logs, and relay debug output over the serial port."
+---
+
+aeryk is a bare-metal kernel, so the usual userland debugger workflow does not apply. Instead, the project pairs QEMU's built-in GDB server with the kernel ELF binary (which retains debug symbols) so you can set breakpoints, step through C code, and inspect registers and memory as if the kernel were a normal process. Serial output and QEMU's interrupt log provide complementary visibility into early-boot behaviour and fault chains before a debugger session is even attached.
+
+## GDB remote debugging
+
+### Starting QEMU in debug mode
+
+The `debug` Makefile target launches QEMU with `-s -S` appended to the normal `QEMUFLAGS`:
+
+```sh
+make debug
+```
+
+`-s` opens a GDB remote-protocol listener on TCP port 1234. `-S` freezes the CPU at the very first instruction, so the machine waits for a `continue` command before executing anything. The full QEMU invocation (from `GNUmakefile`) is:
+
+```makefile
+qemu-system-x86_64 \
+    -M q35 \
+    -drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-x86_64.fd,readonly=on \
+    -cdrom template-x86_64.iso \
+    -s -S \
+    $(QEMUFLAGS)
+```
+
+where `QEMUFLAGS` already includes `-m 2G -d guest_errors,int -D qemu.log -serial stdio`.
+
+### Connecting GDB
+
+In a second terminal, load the kernel ELF (which carries DWARF debug info) and attach to the waiting QEMU instance:
+
+```sh
+gdb kernel/bin-x86_64/kernel
+```
+
+Inside GDB:
+
+```
+(gdb) target remote :1234
+(gdb) break kmain
+(gdb) continue
+```
+
+GDB resolves source locations from the DWARF data, so `break`, `step`, and `next` work at the C source level.
+
+### Useful GDB commands for kernel debugging
+
+| Command | Purpose |
+| ------- | ------- |
+| `info registers` | Dump all general-purpose and segment registers |
+| `x/10i $rip` | Disassemble 10 instructions at the current instruction pointer |
+| `p *current_process` | Pretty-print the current `process_t` struct |
+| `watch tss_entry.rsp0` | Break whenever the kernel stack pointer in the TSS changes |
+| `bt` | Stack backtrace (requires frame pointer or DWARF unwind info) |
+| `layout src` | Split the terminal to show C source alongside the GDB prompt |
+| `set pagination off` | Prevent GDB from pausing long output |
+
+<Tip>
+Press `Ctrl+A X` to exit QEMU when it is running with `-serial stdio`. This key sequence sends a quit signal to the QEMU monitor rather than to the guest, which is important because `Ctrl+C` would be forwarded to the serial line and might kill a userland shell process instead.
+</Tip>
+
+## Serial output
+
+### Configuration
+
+QEMU is started with `-serial stdio` (part of the default `QEMUFLAGS` in `GNUmakefile`), which routes the guest's COM1 port to the terminal that launched QEMU. On the kernel side, `init_serial()` in `kernel/src/arch/x86_64/drivers/serial.h` configures the UART:
+
+```c
+void init_serial();       // initialise COM1
+void serial_putchar(char c);
+void serial_print(const char *c);
+```
+
+The kernel's `print()` function sends output to both the framebuffer TTY and COM1 simultaneously. This means all kernel log messages appear in the terminal even if the framebuffer scrolls away or the TTY renderer crashes.
+
+### Why serial output matters
+
+The UEFI framebuffer is the primary output path, but it has limits:
+
+- Text that scrolls off the top of the screen is lost.
+- A page fault or triple fault during TTY rendering silences all further output.
+- The framebuffer requires the font renderer and slab allocator to be operational — COM1 does not.
+
+Capturing the full boot log is as simple as piping QEMU's stdout:
+
+```sh
+make run 2>&1 | tee boot.log
+```
+
+## QEMU interrupt log
+
+### Enabling the log
+
+The default `QEMUFLAGS` in `GNUmakefile` already include:
+
+```makefile
+QEMUFLAGS := -m 2G -d guest_errors,int -D qemu.log -serial stdio
+```
+
+`-d guest_errors,int` tells QEMU to trace every exception vector and guest error to the log file; `-D qemu.log` writes that trace to `qemu.log` in the current directory.
+
+### Reading the log
+
+Every interrupt or exception that the CPU takes is recorded with its vector number, error code, and CPU state. This is invaluable for diagnosing faults that kill the machine before any kernel code can print a message:
+
+```sh
+# Find all exception entries
+grep "check_exception" qemu.log
+
+# Find double-fault and triple-fault chains
+grep -E "vector=(0x8|0xd|0xe)" qemu.log | tail -30
+```
+
+Common patterns:
+
+| Pattern in qemu.log | Likely cause |
+| -------------------- | ------------ |
+| `check_exception old=0x8 new=0xd` | Double fault → GPF → triple fault; check GDT/TSS/RSP0 |
+| `check_exception old=0xe new=0xe` | Page fault during page-fault handler; likely a bad CR3 or unmapped IDT stack |
+| Repeated `int=0x20` with no `RUN` between | Timer interrupt arriving before the APIC is fully initialised |
+
+<Warning>
+`qemu.log` grows quickly during long runs because every timer tick (`int 0x20`) is logged. For a focused investigation, stop QEMU after reproducing the crash and examine only the tail of the file: `tail -100 qemu.log`.
+</Warning>
+
+## LSP / editor integration
+
+The `GNUmakefile` documents a `bear` invocation to generate `compile_commands.json` for clangd:
+
+```sh
+bear -- make
+```
+
+This captures the exact compiler flags (include paths, `-D` definitions, `-m` switches) for every source file and writes them to `compile_commands.json` in the repo root. clangd reads this file to provide go-to-definition, find-references, and inline diagnostics across the entire kernel source tree, including the cross-compiled target files.
+
+<Note>
+`bear` only needs to be run once, or when new source files are added. The generated `compile_commands.json` is not committed; add it to `.gitignore` if needed.
+</Note>
+
+## Common debug scenarios
+
+### Triple fault at boot
+
+A triple fault means the CPU took an exception, the double-fault handler also faulted, and the machine reset. Check `qemu.log` for the double-fault vector (`0x8`) followed immediately by another exception:
+
+```sh
+grep -A5 "vector=0x8" qemu.log
+```
+
+Usual causes: the IDT is not loaded before interrupts are enabled; the TSS `rsp0` points to unmapped memory; or a GDT descriptor has the wrong access byte. Attach GDB, set a breakpoint on `init_idt` and `init_gdt`, and step through to confirm the descriptor tables are populated before `sti`.
+
+### Page fault killing a userland process
+
+A CPL-3 page fault is *expected* behaviour in aeryk — `isr_handler` in `idt.c` kills the offending process rather than panicking the kernel. If a process dies unexpectedly, check:
+
+1. Whether the fault was a COW fault that `vmm_handle_cow_fault` should have resolved (look for `PTE_PRESENT` clear but the PML4 chain otherwise intact).
+2. Whether the virtual address falls in a valid region — `vmm_map_page` returns without setting `PTE_PRESENT` when the PMM pool is exhausted.
+
+### Scheduler hang
+
+If the system appears to freeze with the timer still firing (serial output stops but `qemu.log` shows `int=0x20` events), add `print()` calls inside `mlfq_on_tick()` to trace queue state:
+
+```c
+print("[sched] tick: current pid=");
+// print pid ...
+```
+
+Because `print()` is mirrored to serial, the output will appear in the terminal even if the framebuffer is also frozen.

@@ -1,0 +1,204 @@
+---
+title: "MLFQ process scheduler in aeryk"
+sidebarTitle: "Scheduler"
+description: "aeryk uses a Multi-Level Feedback Queue scheduler with configurable priority levels, time quanta, periodic priority boost, and an idle process fallback."
+---
+
+aeryk's scheduler implements the **Multi-Level Feedback Queue (MLFQ)** algorithm described in [OSTEP Chapter 8](https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-sched-mlfq.pdf). Rather than requiring the kernel to know a process's CPU behaviour in advance, the MLFQ observes behaviour at runtime and adjusts priority accordingly. Short, interactive processes that yield quickly stay near the top of the queue and get fast response times; long-running, CPU-bound processes naturally sink to lower queues where they receive larger time slices but yield to anything more interactive.
+
+## MLFQ rules
+
+aeryk's MLFQ enforces three core rules:
+
+1. **New processes enter the highest-priority queue (level 0).** Every newly created process is assumed to be interactive until proven otherwise.
+2. **Quantum expiry causes demotion.** If a process consumes its entire time quantum without yielding, its `priority` field is incremented and it is re-enqueued at the next lower level.
+3. **Periodic priority boost prevents starvation.** Every `PRIORITY_BOOST_INTERVAL` ticks all processes in queues 1–3 are moved back to queue 0, their `ticks_executed` counters are reset, and the scheduler is immediately invoked. This ensures that a CPU-bound process can never be starved indefinitely by a stream of higher-priority arrivals.
+
+## Queue configuration
+
+`scheduler.c` defines two compile-time constants that shape the MLFQ:
+
+```c
+#define NUM_QUEUES              4
+#define PRIORITY_BOOST_INTERVAL 100
+```
+
+The four queues are initialised with growing time quanta so that lower-priority processes get longer but less-frequent turns:
+
+| Queue (priority) | Time quantum (ticks) |
+|-----------------|----------------------|
+| 0 (highest)     | 2                    |
+| 1               | 4                    |
+| 2               | 6                    |
+| 3 (lowest)      | 8                    |
+
+Each queue is represented internally by a `queue_t` struct holding `head`, `tail`, and `quantum`:
+
+```c
+typedef struct {
+    process_t *head;
+    process_t *tail;
+    uint32_t   quantum;
+} queue_t;
+
+static queue_t mlfq[NUM_QUEUES];
+```
+
+## Process states
+
+Every `process_t` carries a `process_state_t` that the scheduler reads and writes:
+
+```c
+typedef enum {
+    PROCESS_READY,
+    PROCESS_RUNNING,
+    PROCESS_BLOCKED,
+    PROCESS_DEAD
+} process_state_t;
+```
+
+| State              | Meaning                                                                 |
+|--------------------|-------------------------------------------------------------------------|
+| `PROCESS_READY`    | Enqueued in the MLFQ, waiting to be picked by `mlfq_pick_next()`       |
+| `PROCESS_RUNNING`  | Currently executing on the CPU                                          |
+| `PROCESS_BLOCKED`  | Waiting for an event (e.g. keyboard input); not in the MLFQ             |
+| `PROCESS_DEAD`     | Terminated; resources not yet reclaimed (zombie)                        |
+
+## MLFQ fields on `process_t`
+
+The fields that belong to the scheduler layer sit together in `process_t`:
+
+```c
+uint8_t        priority;       // current MLFQ queue index (0 = highest)
+uint32_t       ticks_executed; // ticks consumed in the current quantum
+struct process *queue_next;    // next pointer within the MLFQ queue
+struct process *queue_prev;    // prev pointer within the MLFQ queue
+```
+
+`queue_next` and `queue_prev` are separate from the `next`/`prev` pointers used by the global process ring, so a process can live in both structures simultaneously.
+
+## Scheduler API
+
+### `mlfq_init`
+
+```c
+void mlfq_init(void);
+```
+
+Initialises the static `mlfq[NUM_QUEUES]` array. Sets every `head` and `tail` to `NULL` and assigns time quanta starting at 2 ticks, incrementing by 2 for each lower-priority level. Called once during `init_scheduler()`.
+
+### `mlfq_enqueue`
+
+```c
+void mlfq_enqueue(process_t *proc);
+```
+
+Appends `proc` to the tail of `mlfq[proc->priority]`. If `proc` is `NULL` or its state is `PROCESS_DEAD`, the call is a no-op. The function sets `proc->state = PROCESS_READY` before linking it in, so callers do not need to update the state themselves.
+
+### `mlfq_pick_next`
+
+```c
+process_t *mlfq_pick_next(void);
+```
+
+Scans `mlfq[0]` through `mlfq[NUM_QUEUES - 1]` and returns the head of the first non-empty queue, removing it from that queue in the process. Returns `NULL` when all queues are empty. The returned process has `queue_next` and `queue_prev` cleared.
+
+### `mlfq_on_tick`
+
+```c
+void mlfq_on_tick(void);
+```
+
+Called by the APIC timer IRQ handler on every tick. It performs two duties:
+
+1. **Boost check** — increments `global_ticks`; when it reaches `PRIORITY_BOOST_INTERVAL` the static `mlfq_boost_all()` helper walks queues 1–3, resets every process's `priority` to 0 and `ticks_executed` to 0, re-enqueues them in queue 0, and calls `schedule()`.
+2. **Quantum expiry** — if the current process has `state == PROCESS_RUNNING` and `ticks_executed >= mlfq[priority].quantum`, its `priority` is incremented (capped at `NUM_QUEUES - 1`), `ticks_executed` is reset, and `schedule()` is called to preempt it.
+
+## The `schedule` function
+
+```c
+void schedule(void);
+```
+
+`schedule()` is the central context-switch entry point. Its steps are:
+
+1. Call `reap_zombies()` to free orphaned dead processes.
+2. Call `wake_blocked_processes()` to re-enqueue any `PROCESS_BLOCKED` processes so they can re-check their wait condition.
+3. If `current_process` is `PROCESS_RUNNING` and not the idle process, re-enqueue it via `mlfq_enqueue()` so it gets another turn later.
+4. Call `mlfq_pick_next()` to select the highest-priority ready process.
+5. If the queue is empty, fall back to `idle_process`.
+6. If the selected process is the same as the current process, return immediately (no-op switch).
+7. Set `current_process = next`, mark it `PROCESS_RUNNING`, update the kernel RSP in the TSS, and call `switch_task(prev, next)`.
+
+## Context switching: `switch_task`
+
+`switch_task` is a small assembly routine in `switch.asm` that follows the System V AMD64 calling convention (`rdi = prev`, `rsi = next`):
+
+```nasm
+switch_task:
+    ; Save callee-saved registers for the outgoing thread
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Persist current RSP into prev->rsp (offset 8 in process_t)
+    mov [rdi + 8], rsp
+
+    ; Load next->rsp (offset 8) and next->cr3 (offset 16)
+    mov rsp, [rsi + 8]
+    mov rax, [rsi + 16]
+    mov cr3, rax
+
+    ; Restore callee-saved registers for the incoming thread
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+
+    ret
+```
+
+When `ret` executes on the new stack it returns to wherever the incoming thread last called `schedule()` (or, for a brand-new thread, to its startup stub). Swapping `cr3` at step 3b gives the new process its own virtual address space.
+
+<Note>
+Only the six callee-saved registers (`rbp`, `rbx`, `r12`–`r15`) plus `rsp` are saved here. Caller-saved registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`) are the responsibility of the C code surrounding the `schedule()` call and need not be preserved across a context switch.
+</Note>
+
+## Idle process
+
+When `mlfq_pick_next()` returns `NULL`, `schedule()` switches to `idle_process`. The idle process:
+
+- Has `pid = 0` and `priority = 3` (the lowest queue).
+- Runs `idle_thread()`, an infinite loop of `sti; hlt` — enables interrupts so the next IRQ can fire, then halts the CPU to save power.
+- Is **never** re-enqueued in the MLFQ; `schedule()` selects it via an explicit fallback rather than by dequeuing it.
+- Is created once during `init_scheduler()` and is never terminated.
+
+## Global process ring
+
+In addition to the per-priority MLFQ queues, every live and zombie process is linked into `process_queue`, a circular doubly-linked list threaded through the `next`/`prev` fields of `process_t`:
+
+```c
+extern process_t *process_queue;
+```
+
+`enqueue_process()` (called from `create_kernel_thread()`, `create_user_process()`, and `fork_process()`) appends a new process to this ring. `reap_zombies()` and `wait_reap_child()` walk it to find and free dead processes.
+
+## Dead process cleanup
+
+Zombie cleanup happens in two places:
+
+| Function | When it runs | What it frees |
+|---|---|---|
+| `reap_zombies()` | Every `schedule()` call | Orphaned dead processes (no parent) |
+| `wait_reap_child(process_t *parent, int64_t pid, int *status_out)` | Explicit `SYS_wait`/`SYS_waitpid` syscall | Dead child of a specific parent |
+
+`wait_reap_child` returns the reaped child's pid on success, `0` if the parent has live children but none are dead yet (the caller should block and retry), or `-1` (`ECHILD`) if the parent has no children at all.
+
+<Warning>
+A process that exits while it still has a living parent is kept as a zombie in `process_queue` until the parent calls `wait_reap_child()`. Only parentless (orphaned) processes are auto-reaped by `reap_zombies()`. Failing to wait on children will leak `process_t` structs.
+</Warning>

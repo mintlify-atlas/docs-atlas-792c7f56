@@ -1,0 +1,329 @@
+---
+title: "aeryk syscall reference: all nine system calls"
+sidebarTitle: "Reference"
+description: "Complete reference for all nine aeryk syscalls: SYS_read, SYS_write, SYS_open, SYS_close, SYS_fork, SYS_execve, SYS_exit, SYS_wait, and SYS_readdir with C signatures and examples."
+---
+
+aeryk exposes nine system calls. All numbers are defined in `abi/include/abi/syscall.h`, the shared ABI header included by both the kernel and libc. Every syscall follows the standard x86_64 Linux ABI: the syscall number goes in `RAX`, up to six arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, and the return value comes back in `RAX`. The libc wrappers in `libc/unistd.c` and `libc/stdlib/exit.c` translate the familiar C signatures into those register placements automatically.
+
+## Syscall number table
+
+| Syscall | Number | Description |
+|---------|--------|-------------|
+| `SYS_read` | 0 | Read from fd |
+| `SYS_write` | 1 | Write to fd |
+| `SYS_open` | 2 | Open a VFS file |
+| `SYS_close` | 3 | Close a file descriptor |
+| `SYS_fork` | 57 | Fork the current process |
+| `SYS_execve` | 59 | Replace process image |
+| `SYS_exit` | 60 | Terminate the process |
+| `SYS_wait` | 61 | Wait for a child process |
+| `SYS_readdir` | 78 | List directory contents |
+
+---
+
+## SYS_read
+
+```c
+ssize_t read(int fd, void *buf, size_t count);
+```
+
+Reads up to `count` bytes from the file descriptor `fd` into `buf`. The kernel handler in `syscall_handler_c` distinguishes two cases: fd 0 (standard input) routes to the keyboard driver; any fd ≥ 3 reads from the VFS node stored in the process's `fd_table`.
+
+<ParamField path="fd" type="int" required>
+  The file descriptor to read from. `0` is standard input (keyboard); fds ≥ 3
+  are file descriptors previously returned by `open()`. fds 1 and 2 (stdout /
+  stderr) are not readable and return `-1`.
+</ParamField>
+
+<ParamField path="buf" type="void *" required>
+  Destination buffer that receives the data. Must be large enough to hold
+  `count` bytes.
+</ParamField>
+
+<ParamField path="count" type="size_t" required>
+  Maximum number of bytes to read. For file fds the kernel clamps this to the
+  remaining bytes in the file if it would exceed the end.
+</ParamField>
+
+**Returns:** Number of bytes actually read, or `-1` on error (invalid fd, fd not open, or node is not a regular file).
+
+<Note>
+  Reading from fd `0` calls `keyboard_read()`, which **blocks** until the user
+  presses Enter. The keyboard driver is line-buffered, so `buf` receives a
+  complete newline-terminated line.
+</Note>
+
+```c
+char line[128];
+ssize_t n = read(0, line, sizeof(line));
+if (n > 0) {
+    write(1, line, n);
+}
+```
+
+---
+
+## SYS_write
+
+```c
+ssize_t write(int fd, const void *buf, size_t count);
+```
+
+Writes `count` bytes from `buf` to the file descriptor `fd`. Currently only fd `1` (standard output, the TTY framebuffer) is writable; all other fd values cause the kernel to skip the `print()` call but still return `count` as if the bytes were consumed.
+
+<ParamField path="fd" type="int" required>
+  The file descriptor to write to. `1` routes to the TTY framebuffer via
+  `print()`. Other values are accepted without error but produce no output.
+</ParamField>
+
+<ParamField path="buf" type="const void *" required>
+  Source buffer containing the bytes to write. The kernel casts this to
+  `const char *` and passes it directly to `print()`.
+</ParamField>
+
+<ParamField path="count" type="size_t" required>
+  Number of bytes to write. The return value is always set to this value.
+</ParamField>
+
+**Returns:** `count` on success, or `count` even on an unrecognised fd (the kernel always returns `frame->rdx`).
+
+```c
+const char *msg = "Hello from userland!\n";
+write(1, msg, 21);
+```
+
+---
+
+## SYS_open
+
+```c
+int open(const char *path);
+```
+
+Looks up `path` in the VFS and, if a regular file is found, allocates the next free slot in the calling process's `fd_table[]` (starting from index 3, reserving 0/1/2 for stdio) and returns its index as the new file descriptor.
+
+<ParamField path="path" type="const char *" required>
+  Absolute path string in the VFS. The kernel calls `vfs_find_node(vfs_root,
+  path)` directly on the user pointer — no copy through a safety wrapper.
+</ParamField>
+
+**Returns:** A file descriptor integer ≥ 3 on success, or `-1` if the path does not exist, the node is not a regular file, or no free fd slot is available.
+
+<Note>
+  Unlike POSIX `open()`, this signature takes **only a path** — there are no
+  `flags` or `mode` arguments yet. The kernel sets `fd_table[fd].flags` to
+  `frame->rsi`, which will be `0` when called through the libc wrapper.
+</Note>
+
+```c
+int fd = open("/files/hello.txt");
+if (fd < 0) {
+    write(1, "open failed\n", 12);
+} else {
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    write(1, buf, n);
+    close(fd);
+}
+```
+
+---
+
+## SYS_close
+
+```c
+int close(int fd);
+```
+
+Releases the file descriptor `fd` by setting `fd_table[fd].node = NULL`. The fd slot becomes available for reuse by the next `open()` call.
+
+<ParamField path="fd" type="int" required>
+  The file descriptor to close. Must be in the range `[3, MAX_FDS)`. Attempting
+  to close fd 0, 1, or 2 returns `-1`.
+</ParamField>
+
+**Returns:** `0` on success, or `-1` if `fd` is out of the valid range.
+
+```c
+int fd = open("/files/data.bin");
+/* ... use fd ... */
+close(fd);
+```
+
+---
+
+## SYS_fork
+
+```c
+int fork(void);
+```
+
+Creates a child process that is an almost-exact clone of the calling process. The kernel calls `fork_process(current_process, &regs)`, which performs a copy-on-write clone of the address space and duplicates the `fd_table`. The `regs` snapshot is built directly from the `syscall_frame` fields — including the callee-saved registers — so the child resumes execution at the instruction immediately following the `syscall` instruction, just like the parent.
+
+**Returns:** The child's PID in the parent, `0` in the child, or `-1` if `fork_process()` fails.
+
+<Note>
+  The callee-saved register fields (`r15`–`rbx`) at the tail of
+  `syscall_frame` exist specifically so that `SYS_fork` can pass a complete
+  `trapframe_t` to `fork_process()`. See the [Overview](/syscalls/overview)
+  for the full frame layout.
+</Note>
+
+```c
+int pid = fork();
+if (pid < 0) {
+    write(1, "fork failed\n", 12);
+} else if (pid == 0) {
+    /* child */
+    write(1, "I am the child\n", 15);
+    exit(0);
+} else {
+    /* parent */
+    int status;
+    wait(pid, &status);
+}
+```
+
+---
+
+## SYS_execve
+
+```c
+int execve(const char *path, char *const argv[]);
+```
+
+Replaces the calling process's memory image with the ELF executable found at `path`. On success the function never returns — the CPU begins executing the new program. The kernel copies `argv` through `copy_argv_from_user()` into fixed kernel buffers before calling `exec_process()`.
+
+<ParamField path="path" type="const char *" required>
+  Path to the ELF binary in the VFS. Copied into a 128-byte kernel buffer;
+  paths longer than 127 bytes are rejected with `-1`.
+</ParamField>
+
+<ParamField path="argv" type="char *const[]" required>
+  NULL-terminated array of argument strings. The kernel copies up to
+  `MAX_USER_ARGS` (8) entries, each truncated to `MAX_ARG_LEN - 1` (127)
+  bytes. An empty or NULL `argv` is rejected with `-1`.
+</ParamField>
+
+**Returns:** Does not return on success. Returns `-1` on failure (path not found, empty argv, copy error, or ELF load failure).
+
+<Warning>
+  `envp` is not yet supported. Environment variables are not passed to the new
+  process image. Passing a third argument has no effect.
+</Warning>
+
+```c
+char *argv[] = { "myapp", "--verbose", NULL };
+execve("/bin/myapp", argv);
+/* only reached on failure */
+write(1, "exec failed\n", 12);
+```
+
+---
+
+## SYS_exit
+
+```c
+void exit(int status);
+```
+
+Terminates the calling process. The kernel sets `current_process->exit_code = status`, transitions the process state to `PROCESS_DEAD`, and calls `schedule()` to hand the CPU to the next runnable process. The `exit()` wrapper in `libc/stdlib/exit.c` is marked `__builtin_unreachable()` after the `syscall` instruction to inform the compiler that it never returns.
+
+<ParamField path="status" type="int" required>
+  Exit status code stored in `current_process->exit_code`. A waiting parent
+  can retrieve this value via `SYS_wait`.
+</ParamField>
+
+**Returns:** Never returns.
+
+```c
+exit(0);   /* clean exit */
+exit(1);   /* exit with error code 1 */
+```
+
+---
+
+## SYS_wait
+
+```c
+int wait(int pid, int *status);
+```
+
+Waits for a child process to terminate and reaps it. If no matching child has died yet, the kernel sets `current_process->state = PROCESS_BLOCKED` and calls `schedule()` in a loop until `wait_reap_child()` succeeds. The child's exit code is written to `*status` once a child is reaped.
+
+<ParamField path="pid" type="int" required>
+  Target child PID. Pass a value **greater than 0** to wait for a specific
+  child, or a value **≤ 0** to wait for any child of the calling process.
+</ParamField>
+
+<ParamField path="status" type="int *" required>
+  Pointer to an integer that receives the reaped child's exit code. May be
+  `NULL` if the exit code is not needed.
+</ParamField>
+
+**Returns:**
+- Reaped child PID (> 0) on success.
+- `0` if the process has children but none have exited yet (only possible if `wait_reap_child` returns 0 on the first poll before blocking — in practice the kernel loops until a child dies).
+- `-1` (`ECHILD`) if the process has no children at all.
+
+```c
+int child = fork();
+if (child == 0) {
+    /* ... do work ... */
+    exit(42);
+} else {
+    int status;
+    int reaped = wait(child, &status);
+    /* status == 42, reaped == child */
+}
+```
+
+---
+
+## SYS_readdir
+
+```c
+ssize_t listdir(const char *path, char *buf, size_t size);
+```
+
+Lists the children of a VFS directory node into `buf` as a sequence of newline-separated names. Directory entries have a trailing `/` appended before the newline. The kernel writes entries until the buffer is full or all children have been written — it does not truncate a partial entry.
+
+<ParamField path="path" type="const char *" required>
+  Path to the directory in the VFS. The kernel calls `vfs_find_node()` and
+  rejects the call with `-1` if the node does not exist or is not of type
+  `VFS_DIRECTORY`.
+</ParamField>
+
+<ParamField path="buf" type="char *" required>
+  Destination buffer that receives the formatted directory listing. Each entry
+  is written as `name` (+ `/` if a directory) + `\n`.
+</ParamField>
+
+<ParamField path="size" type="size_t" required>
+  Size of `buf` in bytes. The kernel stops writing before an entry that would
+  overflow the buffer.
+</ParamField>
+
+**Returns:** Total bytes written into `buf` on success, or `-1` if `path` is not a directory or does not exist.
+
+<Note>
+  The libc wrapper for this syscall is named `listdir()`, not `readdir()`.
+  There is no `DIR *` handle — the entire listing is written into a flat
+  buffer in a single call.
+</Note>
+
+```c
+char buf[1024];
+ssize_t n = listdir("/", buf, sizeof(buf));
+if (n < 0) {
+    write(1, "not a directory\n", 16);
+} else {
+    write(1, buf, n);
+}
+/* example output:
+   bin/
+   files/
+   readme.txt
+*/
+```
