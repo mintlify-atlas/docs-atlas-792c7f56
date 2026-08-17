@@ -1,7 +1,7 @@
 ---
-title: "aeryk syscall reference: all nine system calls"
+title: "aeryk syscall reference: all nine system calls table"
 sidebarTitle: "Reference"
-description: "Complete reference for all nine aeryk syscalls: SYS_read, SYS_write, SYS_open, SYS_close, SYS_fork, SYS_execve, SYS_exit, SYS_wait, and SYS_readdir with C signatures and examples."
+description: "Reference for all nine aeryk syscalls: numbers, C signatures, and usage examples for read, write, open, fork, execve, exit, and wait."
 ---
 
 aeryk exposes nine system calls. All numbers are defined in `abi/include/abi/syscall.h`, the shared ABI header included by both the kernel and libc. Every syscall follows the standard x86_64 Linux ABI: the syscall number goes in `RAX`, up to six arguments in `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`, and the return value comes back in `RAX`. The libc wrappers in `libc/unistd.c` and `libc/stdlib/exit.c` translate the familiar C signatures into those register placements automatically.

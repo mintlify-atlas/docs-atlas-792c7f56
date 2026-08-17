@@ -95,6 +95,8 @@ After QEMU starts you will see the Limine menu (5-second timeout, then auto-boot
 [-] Serial initialized.
 [0] PMM Initialized
 [1] VMM Initialized.
+[2] APIC verified online.
+[3] IRQ0 PIT Timer calibration started.
 [4] Slab Allocator kmalloc online.
 [-] Slab Allocator initialized.
 [5] Scheduler initialized.
@@ -114,7 +116,9 @@ What each line means:
 | `Serial initialized.` | COM1 serial port ready (output mirrored to your terminal via `-serial stdio`) |
 | `PMM Initialized` | Physical memory manager has parsed the Limine memory map |
 | `VMM Initialized.` | Virtual memory / paging active; higher-half kernel mapping in place |
-| `Slab Allocator kmalloc online.` | APIC timer calibrated and firing; `kmalloc`/`kfree` available |
+| `APIC verified online.` | Local APIC enabled; I/O APIC IRQ routing configured |
+| `IRQ0 PIT Timer calibration started.` | PIT timer initialised and firing for APIC calibration |
+| `Slab Allocator kmalloc online.` | `kmalloc`/`kfree` are available for kernel heap allocations |
 | `Slab Allocator initialized.` | Slab caches set up |
 | `Scheduler initialized.` | MLFQ scheduler ready to accept processes |
 | `Parsing initramfs...` | CPIO archive parsed and VFS populated under `/` |

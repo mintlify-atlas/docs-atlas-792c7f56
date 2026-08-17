@@ -71,7 +71,7 @@ void serial_putchar(char c);
 void serial_print(const char *c);
 ```
 
-`serial_putchar` busy-waits on `is_transmit_empty(COM1)` before writing a byte to port `0x3F8`. `serial_print` is a simple wrapper that calls `serial_putchar` for each character of a NUL-terminated string.
+`serial_putchar` spins on `is_transmit_empty(COM1)` — looping while the return value is zero (transmitter busy) — and writes the byte to port `0x3F8` on each iteration, so the byte lands as soon as the UART is ready. `serial_print` is a simple wrapper that calls `serial_putchar` for each character of a NUL-terminated string.
 
 ```c
 int is_transmit_empty(int port); // returns nonzero when UART THRE bit is set
@@ -197,7 +197,7 @@ void print(const char *str);
 
 The kernel's primary console output function. `print()` iterates over `str` one character at a time, calling `put_char()` for printable characters, advancing `cursor_position.x` by 8 pixels per character, and wrapping to the next line when the right edge is reached. A `'\n'` advances `cursor_position.y` by 16 pixels (one glyph row) and resets `x` to 0.
 
-When the cursor reaches the bottom of the framebuffer, the renderer scrolls the entire display up by one character row by `memmove`-ing the framebuffer contents upward by `pixels_per_scan_line × 16 × sizeof(uint32_t)` bytes and clearing the newly exposed bottom row.
+When the cursor reaches the bottom of the framebuffer (`cursor_position.y + 16 > framebuffer->height`), the renderer calls `clear(global_renderer, BG, true)`, which fills the entire framebuffer with the background colour and resets the cursor to `{0, 0}`. aeryk does not currently implement line-by-line scrolling.
 
 The Gruvbox Dark colour palette is defined as 32-bit BGRA constants directly in `tty.h` and includes semantic aliases used throughout the kernel:
 

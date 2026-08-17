@@ -1,5 +1,5 @@
 ---
-title: "Boot sequence: Limine to kmain in aeryk"
+title: "aeryk boot: Limine bootloader protocol and kmain()"
 sidebarTitle: "Boot"
 description: "How aeryk boots: Limine bootloader loads the kernel ELF, sets up the framebuffer and initramfs modules, then transfers control to kmain()."
 ---
@@ -184,6 +184,9 @@ The kernel's framebuffer text renderer requires a PSF1 bitmap font before it can
 static struct limine_file *find_module_by_suffix(
     struct limine_module_response *modules, const char *suffix)
 {
+    if (modules == NULL)
+        return NULL;
+
     size_t slen = strlen(suffix);
     for (size_t i = 0; i < modules->module_count; i++) {
         struct limine_file *mod = modules->modules[i];

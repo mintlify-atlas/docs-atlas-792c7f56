@@ -308,11 +308,17 @@ void main(void) {
 ```
 exectest: before fork
 exectest: child execing /bin/ls
-bin/
+init
+cat
+sh
+ls
+forktest
+exectest
+crashtest
 exectest: parent reaped pid=<pid> status=0
 ```
 
-The directory listing produced by the exec'd `ls` appearing in the middle of `exectest`'s output confirms that the child's image was completely replaced by `/bin/ls` and that its stdout (fd 1) was inherited correctly.
+The directory listing produced by the exec'd `ls` appearing in the middle of `exectest`'s output confirms that the child's image was completely replaced by `/bin/ls` and that its stdout (fd 1) was inherited correctly. The exact ordering of `/bin` entries depends on the order they were packed into the CPIO initramfs.
 
 ---
 

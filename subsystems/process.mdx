@@ -1,7 +1,7 @@
 ---
 title: "Process model: creation, fork, exec, and file descriptors"
 sidebarTitle: "Process Model"
-description: "aeryk's process_t structure, ELF64 loader, copy-on-write fork, execve image replacement, per-process file descriptor table, and kernel-to-usermode transition."
+description: "aeryk's process_t struct, ELF64 loader, copy-on-write fork, execve image replacement, per-process file descriptor table, and kernel-to-usermode transition."
 ---
 
 Every schedulable unit in aeryk is represented by a `process_t` struct defined in `process.h`. The same type covers kernel threads (which never leave ring 0) and full user processes (which run ring-3 ELF64 binaries). User processes get their own page table, a user-mode stack, and an open file descriptor table; kernel threads share the kernel page table and have nothing but a stack and a function pointer. Both kinds are tracked in the same global process ring and scheduled by the same MLFQ.

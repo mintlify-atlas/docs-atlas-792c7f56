@@ -115,6 +115,12 @@ void vmm_map_page(uint64_t *pml4, uint64_t virtual_addr,
 // Returns the kernel PML4 pointer (set by init_vmm).
 uint64_t *vmm_get_kernel_pml4(void);
 
+// Marks every page-table level covering virtual_addr as user-accessible
+// (sets PTE_USER on the PML4/PDPT/PD/PT entries) without altering the
+// physical address or other flags. Used to promote pages that Limine
+// mapped supervisor-only into a user-accessible segment or stack region.
+void vmm_set_page_user(uint64_t *pml4, uint64_t virtual_addr);
+
 // Allocates a new PML4 for a user process.
 // Copies kernel-half entries (256-511) from the kernel PML4.
 // Returns the HHDM virtual address of the new PML4, or NULL.

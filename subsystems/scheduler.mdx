@@ -1,5 +1,5 @@
 ---
-title: "MLFQ process scheduler in aeryk"
+title: "aeryk MLFQ scheduler: priority queues and preemption"
 sidebarTitle: "Scheduler"
 description: "aeryk uses a Multi-Level Feedback Queue scheduler with configurable priority levels, time quanta, periodic priority boost, and an idle process fallback."
 ---
@@ -111,7 +111,7 @@ void mlfq_on_tick(void);
 
 Called by the APIC timer IRQ handler on every tick. It performs two duties:
 
-1. **Boost check** — increments `global_ticks`; when it reaches `PRIORITY_BOOST_INTERVAL` the static `mlfq_boost_all()` helper walks queues 1–3, resets every process's `priority` to 0 and `ticks_executed` to 0, re-enqueues them in queue 0, and calls `schedule()`.
+1. **Boost check** — increments `global_ticks`; when it reaches `PRIORITY_BOOST_INTERVAL` the static `mlfq_boost_all()` helper walks queues 1–3, resets every enqueued process's `priority` to 0 and `ticks_executed` to 0, and re-enqueues them in queue 0. Because the currently running process is not sitting in any queue, `mlfq_on_tick` separately resets `current_process->priority` and `ticks_executed` to 0 (unless it is the idle process), then calls `schedule()`.
 2. **Quantum expiry** — if the current process has `state == PROCESS_RUNNING` and `ticks_executed >= mlfq[priority].quantum`, its `priority` is incremented (capped at `NUM_QUEUES - 1`), `ticks_executed` is reset, and `schedule()` is called to preempt it.
 
 ## The `schedule` function

@@ -1,5 +1,5 @@
 ---
-title: "GDT, IDT, and APIC interrupt handling in aeryk"
+title: "GDT, IDT, and APIC interrupt handling in aeryk kernel"
 sidebarTitle: "Interrupts"
 description: "How aeryk configures the Global Descriptor Table, Interrupt Descriptor Table, and APIC for exception handling, IRQ routing, and the APIC timer tick."
 ---
@@ -256,6 +256,10 @@ uint32_t lapic_read(uint32_t reg);
 // Signal End-of-Interrupt to the LAPIC (writes 0 to LAPIC_EOI).
 // Must be called by every IRQ handler before returning.
 void lapic_eoi(void);
+
+// Write a 32-bit value to I/O APIC indirect register `reg`.
+// Used internally by ioapic_set_irq().
+void ioapic_write(uint32_t reg, uint32_t value);
 ```
 
 ### IOAPIC IRQ routing

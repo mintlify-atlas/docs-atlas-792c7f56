@@ -162,7 +162,7 @@ The constraints map directly to registers: `"0"` reuses the `"=a"` operand slot 
 
 The syscall numbers (`SYS_read`, `SYS_write`, …) live in a single header that both the kernel and libc include:
 
-```
+```text
 abi/include/abi/syscall.h   ← single source of truth
     ↑                             ↑
 kernel/src/arch/x86_64/     libc/include/sys/
